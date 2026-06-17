@@ -2,189 +2,93 @@ FROM sonatype/nexus3:latest
 
 USER 0
 
-# Install JDK (javac) - the runtime only has JRE
-RUN yum install -y java-21-openjdk-devel 2>/dev/null || \
-    dnf install -y java-21-openjdk-devel 2>/dev/null || \
-    microdnf install -y java-21-openjdk-devel 2>/dev/null || true
+# Just the filter + config. No descriptor, no capability, no datastore check.
+# Config is read from /nexus-data/etc/port-gate.conf (hot-reloadable).
+RUN mkdir -p /tmp/src/com/sonatype/nexus/plugins/portgate /tmp/build /tmp/cp
 
-# Create plugin source
-RUN mkdir -p /tmp/plugin/src/com/sonatype/nexus/plugins/portgate /tmp/plugin/build
-
-# PortGateConfig
-RUN cat > /tmp/plugin/src/com/sonatype/nexus/plugins/portgate/PortGateConfig.java << 'JAVA'
+RUN cat > /tmp/src/com/sonatype/nexus/plugins/portgate/PortGateFilter.java << 'JAVA'
 package com.sonatype.nexus.plugins.portgate;
-import java.util.*;
-import java.util.concurrent.atomic.AtomicReference;
-import javax.inject.Named;
-import javax.inject.Singleton;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
-@Named @Singleton
-public class PortGateConfig {
-    private static final Logger log = LoggerFactory.getLogger(PortGateConfig.class);
-    private final AtomicReference<Snapshot> current = new AtomicReference<>(new Snapshot(false, 0, Collections.emptyList()));
-
-    void update(boolean enabled, int scopedPort, List<String> allowedPrefixes) {
-        current.set(new Snapshot(enabled, scopedPort, Collections.unmodifiableList(new ArrayList<>(allowedPrefixes))));
-        log.info("Port-gate config updated: enabled={}, port={}, {} paths", enabled, scopedPort, allowedPrefixes.size());
-    }
-    void clear() { current.set(new Snapshot(false, 0, Collections.emptyList())); log.info("Port-gate config cleared"); }
-    public boolean isEnabled() { return current.get().enabled; }
-    public int getScopedPort() { return current.get().scopedPort; }
-    public List<String> getAllowedPrefixes() { return current.get().allowedPrefixes; }
-
-    static List<String> parseAllowedPaths(String raw) {
-        if (raw == null || raw.isBlank()) return Collections.emptyList();
-        List<String> result = new ArrayList<>();
-        for (String line : raw.split("\n")) { String t = line.trim(); if (!t.isEmpty() && !t.startsWith("#")) result.add(t); }
-        return result;
-    }
-    private static final class Snapshot { final boolean enabled; final int scopedPort; final List<String> allowedPrefixes; Snapshot(boolean e, int p, List<String> a) { enabled=e; scopedPort=p; allowedPrefixes=a; } }
-}
-JAVA
-
-RUN cat > /tmp/plugin/src/com/sonatype/nexus/plugins/portgate/PortGateFilter.java << 'JAVA'
-package com.sonatype.nexus.plugins.portgate;
-import java.io.IOException;
-import javax.inject.Inject;
-import javax.inject.Named;
-import javax.inject.Singleton;
-import javax.servlet.*;
-import javax.servlet.http.*;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
+import java.io.IOException; import java.nio.file.*; import java.util.*;
+import javax.inject.*; import javax.servlet.*; import javax.servlet.http.*;
+import org.slf4j.*;
 @Named @Singleton
 public class PortGateFilter implements Filter {
     private static final Logger log = LoggerFactory.getLogger(PortGateFilter.class);
-    private final PortGateConfig config;
-    @Inject
-    public PortGateFilter(PortGateConfig config) { this.config = config; }
-    public void init(FilterConfig fc) { log.info("Port-gate filter initialised"); }
-    public void doFilter(ServletRequest request, ServletResponse response, FilterChain chain) throws IOException, ServletException {
-        int localPort = request.getLocalPort();
-        if (localPort == config.getScopedPort() && config.isEnabled()) {
-            String path = ((HttpServletRequest) request).getRequestURI();
-            for (String prefix : config.getAllowedPrefixes()) {
-                if (path.startsWith(prefix)) { chain.doFilter(request, response); return; }
+    private volatile int scopedPort = 8443;
+    private volatile List<String> allowed = Collections.emptyList();
+
+    public PortGateFilter() {
+        // Watch config file for changes (hot reload, no restart)
+        Thread t = new Thread(() -> {
+            Path conf = Paths.get("/nexus-data/etc/port-gate.conf");
+            loadConfig(conf);
+            try (WatchService ws = FileSystems.getDefault().newWatchService()) {
+                if (conf.getParent() != null) conf.getParent().register(ws, StandardWatchEventKinds.ENTRY_MODIFY);
+                while (!Thread.currentThread().isInterrupted()) {
+                    ws.take().pollEvents().forEach(e -> { if (e.context().toString().equals("port-gate.conf")) loadConfig(conf); });
+                    ws.take().reset();
+                }
+            } catch (Exception e) { log.warn("Config watch stopped: {}", e.getMessage()); }
+        });
+        t.setDaemon(true); t.start();
+    }
+
+    private void loadConfig(Path conf) {
+        try {
+            List<String> lines = Files.readAllLines(conf);
+            List<String> paths = new ArrayList<>();
+            for (String l : lines) {
+                String t = l.trim();
+                if (t.isEmpty() || t.startsWith("#")) continue;
+                if (t.startsWith("port=")) { scopedPort = Integer.parseInt(t.substring(5).trim()); }
+                else paths.add(t);
             }
-            HttpServletResponse hr = (HttpServletResponse) response;
-            hr.setStatus(403); hr.setContentType("text/plain");
-            hr.getWriter().write("Port-gate: denied on port " + localPort + " for " + path + "\n");
+            allowed = Collections.unmodifiableList(paths);
+            log.info("Port-gate loaded: port={}, {} paths", scopedPort, allowed.size());
+        } catch (Exception e) {
+            log.warn("Could not read {}: {}", conf, e.getMessage());
+        }
+    }
+
+    public void init(FilterConfig f) { log.info("Port-gate filter initialised"); }
+
+    public void doFilter(ServletRequest q, ServletResponse s, FilterChain c) throws IOException, ServletException {
+        int port = q.getLocalPort();
+        if (port == scopedPort) {
+            String path = ((HttpServletRequest)q).getRequestURI();
+            for (String p : allowed) if (path.startsWith(p)) { c.doFilter(q,s); return; }
+            HttpServletResponse h = (HttpServletResponse)s;
+            h.setStatus(403); h.setContentType("text/plain");
+            h.getWriter().write("Port-gate: denied on port "+port+" for "+path+"\n");
             return;
         }
-        chain.doFilter(request, response);
+        c.doFilter(q,s);
     }
     public void destroy() {}
 }
 JAVA
 
-RUN cat > /tmp/plugin/src/com/sonatype/nexus/plugins/portgate/PortGateCapability.java << 'JAVA'
-package com.sonatype.nexus.plugins.portgate;
-import java.util.*;
-import javax.inject.Inject;
-import javax.inject.Named;
-import javax.inject.Singleton;
-import org.sonatype.nexus.capability.CapabilitySupport;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
-@Named("agent-trust.port-gate") @Singleton
-public class PortGateCapability extends CapabilitySupport<PortGateCapability.Config> {
-    public static final String TYPE_ID = "agent-trust.port-gate";
-    private static final Logger log = LoggerFactory.getLogger(PortGateCapability.class);
-    private static final int DEFAULT_PORT = 8443;
-    private final PortGateConfig portGateConfig;
-    @Inject
-    public PortGateCapability(PortGateConfig portGateConfig) { this.portGateConfig = portGateConfig; }
-    @Override
-    protected Config createConfig(final Map<String, String> properties) throws Exception {
-        int scopedPort = DEFAULT_PORT;
-        try { scopedPort = Integer.parseInt(properties.getOrDefault("scopedPort", String.valueOf(DEFAULT_PORT)).trim()); } catch (NumberFormatException e) {}
-        return new Config(scopedPort, PortGateConfig.parseAllowedPaths(properties.getOrDefault("allowedPaths", "")));
-    }
-    @Override
-    protected void onUpdate(Config config) throws Exception { portGateConfig.update(true, config.scopedPort, config.allowedPaths); log.info("Port-gate updated: port={}, {} paths", config.scopedPort, config.allowedPaths.size()); }
-    @Override
-    protected void onActivate(Config config) throws Exception { portGateConfig.update(true, config.scopedPort, config.allowedPaths); log.info("Port-gate activated"); }
-    @Override
-    protected void onPassivate(Config config) throws Exception { portGateConfig.clear(); }
-    @Override
-    protected void onRemove(Config config) throws Exception { portGateConfig.clear(); }
-    @Override
-    protected String renderDescription() {
-        Config cfg = getConfig();
-        return cfg != null ? "Port-Gate: scoped port " + cfg.scopedPort + ", " + cfg.allowedPaths.size() + " path(s)" : "Port-Gate";
-    }
-    static final class Config { final int scopedPort; final List<String> allowedPaths; Config(int p, List<String> a) { scopedPort=p; allowedPaths=a; } }
-}
-JAVA
-
-RUN cat > /tmp/plugin/src/com/sonatype/nexus/plugins/portgate/PortGateCapabilityDescriptor.java << 'JAVA'
-package com.sonatype.nexus.plugins.portgate;
-import java.util.*;
-import javax.inject.Named;
-import javax.inject.Singleton;
-import org.sonatype.nexus.capability.CapabilityDescriptorSupport;
-import org.sonatype.nexus.capability.CapabilityType;
-import org.sonatype.nexus.formfields.FormField;
-import org.sonatype.nexus.formfields.NumberTextFormField;
-import org.sonatype.nexus.formfields.TextAreaFormField;
-
-@Named("agent-trust.port-gate-descriptor") @Singleton
-public class PortGateCapabilityDescriptor extends CapabilityDescriptorSupport {
-    private static final int VERSION = 1;
-    private final NumberTextFormField scopedPortField;
-    private final TextAreaFormField allowedPathsField;
-    public PortGateCapabilityDescriptor() {
-        scopedPortField = new NumberTextFormField("scopedPort", "Scoped port", "Nexus port for agent traffic.", FormField.MANDATORY);
-        scopedPortField.withInitialValue(8443);
-        allowedPathsField = new TextAreaFormField("allowedPaths", "Allowed repository paths", "One path per line. # for comments.", FormField.MANDATORY);
-    }
-    @Override
-    public CapabilityType type() { return new CapabilityType(PortGateCapability.TYPE_ID); }
-    @Override
-    public String name() { return "Agent Trust: Port Gate"; }
-    @Override
-    public int version() { return VERSION; }
-    @Override
-    public String about() { return "Gates repository access on a scoped port."; }
-    @Override
-    public List<FormField> formFields() { return List.of(scopedPortField, allowedPathsField); }
-    @Override
-    @SuppressWarnings("rawtypes")
-    protected Object createConfig(final Map properties) { return properties; }
-}
-JAVA
-
-# Extract classpath from the fat JAR
-RUN mkdir -p /tmp/cp && cd /tmp/cp && \
-    jar xf /opt/sonatype/nexus/bin/sonatype-nexus-repository-*.jar BOOT-INF/classes BOOT-INF/lib && \
-    cp -r BOOT-INF/classes/* . 2>/dev/null; \
-    cp BOOT-INF/lib/*.jar . 2>/dev/null; \
-    rm -rf BOOT-INF META-INF org && \
-    echo "Classpath: $(find . -name '*.jar' | wc -l) JARs"
-
 # Compile
-RUN javac -cp "/tmp/cp:/tmp/cp/*" -d /tmp/plugin/build \
-    $(find /tmp/plugin/src -name '*.java') && \
-    echo "Compiled: $(find /tmp/plugin/build -name '*.class' | wc -l) classes"
+RUN cd /tmp/cp && jar xf /opt/sonatype/nexus/bin/sonatype-nexus-repository-*.jar BOOT-INF/lib && \
+    cp BOOT-INF/lib/*.jar . && rm -rf BOOT-INF && \
+    javac -cp "/tmp/cp/*" -d /tmp/build $(find /tmp/src -name '*.java') && \
+    echo "Compiled $(find /tmp/build -name '*.class' | wc -l) classes"
 
-# Create sisu discovery
-RUN mkdir -p /tmp/plugin/build/META-INF/sisu && \
-    printf "com.sonatype.nexus.plugins.portgate.PortGateFilter\ncom.sonatype.nexus.plugins.portgate.PortGateConfig\ncom.sonatype.nexus.plugins.portgate.PortGateCapability\ncom.sonatype.nexus.plugins.portgate.PortGateCapabilityDescriptor\n" > /tmp/plugin/build/META-INF/sisu/javax.inject.Named
+# Package
+RUN mkdir -p /tmp/build/META-INF/sisu && \
+    printf "com.sonatype.nexus.plugins.portgate.PortGateFilter\n" > /tmp/build/META-INF/sisu/javax.inject.Named && \
+    mkdir -p /opt/sonatype/nexus/plugins && \
+    jar cf /opt/sonatype/nexus/plugins/port-gate-plugin.jar -C /tmp/build .
 
-# Inject into fat JAR under BOOT-INF/classes/
-RUN mkdir -p /tmp/inject/BOOT-INF/classes && \
-    cp -r /tmp/plugin/build/* /tmp/inject/BOOT-INF/classes/ && \
-    cd /tmp/inject && \
-    jar uf /opt/sonatype/nexus/bin/sonatype-nexus-repository-*.jar \
-        BOOT-INF/classes/com \
-        BOOT-INF/classes/META-INF/sisu/javax.inject.Named && \
-    echo "Injected plugin into fat JAR"
+# loader.properties to add plugins dir
+RUN printf "loader.path=BOOT-INF/classes,BOOT-INF/lib,/opt/sonatype/nexus/plugins\n" > /tmp/loader.properties && \
+    cd /tmp && jar uf /opt/sonatype/nexus/bin/sonatype-nexus-repository-*.jar loader.properties
 
-# Cleanup
-RUN rm -rf /tmp/plugin /tmp/cp /tmp/inject
+# Default config
+RUN mkdir -p /nexus-data/etc && \
+    printf "# Port-gate configuration\nport=8443\n/repository/maven-releases/\n/repository/maven-central/\n" > /nexus-data/etc/port-gate.conf && \
+    chown -R nexus:nexus /nexus-data
+
+RUN rm -rf /tmp/*
 
 USER nexus
