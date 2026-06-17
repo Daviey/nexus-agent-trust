@@ -1,0 +1,94 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Nexus Port-Gate Plugin: Maven project for building the OSGi bundle.
+
+  Build:
+    mvn package
+
+  Deploy:
+    cp target/nexus-port-gate-plugin-1.0.0.jar $NEXUS_HOME/deploy/
+    (restart Nexus)
+
+  Configure (via JVM args in nexus.vmoptions):
+    -Dnexus.portgate.scopedPort=8082
+    -Dnexus.portgate.allowed=/repository/trusted/,/repository/npm-agent/
+-->
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0
+         http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <groupId>com.example.nexus</groupId>
+    <artifactId>nexus-port-gate-plugin</artifactId>
+    <version>1.0.0</version>
+    <packaging>bundle</packaging>
+
+    <name>Nexus Port-Gate Plugin</name>
+    <description>Gates repository access based on the local TCP port</description>
+
+    <properties>
+        <maven.compiler.source>11</maven.compiler.source>
+        <maven.compiler.target>11</maven.compiler.target>
+        <nexus.version>3.93.0-06</nexus.version>
+    </properties>
+
+    <dependencies>
+        <dependency>
+            <groupId>javax.servlet</groupId>
+            <artifactId>javax.servlet-api</artifactId>
+            <version>4.0.1</version>
+            <scope>provided</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.sonatype.nexus</groupId>
+            <artifactId>nexus-security</artifactId>
+            <version>${nexus.version}</version>
+            <scope>provided</scope>
+        </dependency>
+        <dependency>
+            <groupId>com.google.inject</groupId>
+            <artifactId>guice</artifactId>
+            <version>5.1.0</version>
+            <scope>provided</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.apache.felix</groupId>
+                <artifactId>maven-bundle-plugin</artifactId>
+                <version>5.1.9</version>
+                <extensions>true</extensions>
+                <configuration>
+                    <instructions>
+                        <Bundle-SymbolicName>com.example.nexus.port-gate</Bundle-SymbolicName>
+                        <Bundle-Name>Nexus Port-Gate Plugin</Bundle-Name>
+                        <Bundle-Version>${project.version}</Bundle-Version>
+                        <Import-Package>
+                            javax.servlet;version="[3,5)",
+                            javax.servlet.http;version="[3,5)",
+                            javax.inject;version="1.0",
+                            org.eclipse.sisu;version="[0.3,1)",
+                            org.eclipse.sisu.space;version="[0.3,1)"
+                        </Import-Package>
+                        <_dsannotations>*</_dsannotations>
+                        <_metatypeannotations>*</_metatypeannotations>
+                    </instructions>
+                </configuration>
+            </plugin>
+        </plugins>
+    </build>
+
+    <repositories>
+        <repository>
+            <id>sonatype-public</id>
+            <url>https://repository.sonatype.org/content/groups/sonatype-public-grid/</url>
+        </repository>
+        <repository>
+            <id>central</id>
+            <url>https://repo1.maven.org/maven2/</url>
+        </repository>
+    </repositories>
+</project>

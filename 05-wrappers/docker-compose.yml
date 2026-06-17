@@ -1,0 +1,36 @@
+services:
+  # A simple mock registry that records what was requested.
+  # The wrapper scripts point at this as the "scoped" registry.
+  mock-registry:
+    image: nginx:alpine
+    container_name: wrapper-registry
+    ports:
+      - "39080:80"
+    volumes:
+      - ./test/mock-registry.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./test/mock-packages:/usr/share/nginx/html:ro
+    networks:
+      - poc-net
+
+  # The "agent" container: has wrappers in PATH, permission configs,
+  # and a test that proves wrappers are the only way to install.
+  tester:
+    image: node:20-alpine
+    container_name: wrapper-tester
+    depends_on:
+      - mock-registry
+    volumes:
+      - ./wrappers:/wrappers:ro
+      - ./test:/test:ro
+      - ./opencode.json:/config/opencode.json:ro
+      - ./claude-settings.json:/config/claude-settings.json:ro
+    environment:
+      - NPM_SCOPED_REGISTRY=http://mock-registry/npm-agent/
+      - PATH=/wrappers:/usr/local/bin:/usr/bin:/bin
+    entrypoint: ["/bin/sh", "/test/run-tests.sh"]
+    networks:
+      - poc-net
+
+networks:
+  poc-net:
+    driver: bridge

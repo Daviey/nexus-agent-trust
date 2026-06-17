@@ -1,0 +1,94 @@
+services:
+  nexus:
+    image: sonatype/nexus3:latest
+    container_name: full-nexus
+    volumes:
+      - nexus-data:/nexus-data
+    networks:
+      - poc-net
+
+  nexus-init:
+    image: alpine:latest
+    depends_on:
+      nexus:
+        condition: service_started
+    volumes:
+      - nexus-data:/nexus-data
+      - ./init:/init:ro
+    entrypoint: ["/bin/sh", "-c", "apk add --no-cache curl >/dev/null 2>&1 && exec /bin/sh /init/setup-nexus.sh"]
+    networks:
+      - poc-net
+
+  gateway:
+    image: nginx:alpine
+    container_name: full-gateway
+    ports:
+      - "443:443"
+      - "58443:8443"
+    volumes:
+      - ./nginx/gateway.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./certs:/etc/nginx/certs:ro
+    depends_on:
+      nexus:
+        condition: service_started
+    networks:
+      - poc-net
+
+  forward-proxy:
+    build: ../01-http-baseline/forward-proxy
+    container_name: full-proxy
+    environment:
+      - FULL_PORT=443
+      - SCOPED_PORT=8443
+    ports:
+      - "53128:3128"
+    depends_on:
+      - gateway
+    networks:
+      - poc-net
+
+  # Agent-side test container: has wrappers in PATH, permission configs,
+  # and the CA cert for HTTPS verification.
+  agent-tester:
+    image: node:20-alpine
+    container_name: full-agent-tester
+    depends_on:
+      nexus-init:
+        condition: service_completed_successfully
+      forward-proxy:
+        condition: service_started
+    volumes:
+      - ./certs/ca-cert.pem:/etc/ssl/certs/poc-ca.pem:ro
+      - ./wrappers:/wrappers:ro
+      - ./test:/test:ro
+      - ./opencode.json:/config/opencode.json:ro
+      - ./claude-settings.json:/config/claude-settings.json:ro
+    environment:
+      - HTTPS_PROXY=http://forward-proxy:3128
+      - NPM_SCOPED_REGISTRY=https://gateway:8443/repository/trusted/
+      - NODE_EXTRA_CA_CERTS=/etc/ssl/certs/poc-ca.pem
+      - PATH=/wrappers:/usr/local/bin:/usr/bin:/bin:/sbin
+    entrypoint: ["/bin/sh", "-c", "apk add --no-cache curl >/dev/null 2>&1 && exec /bin/sh /test/run-tests.sh"]
+    networks:
+      - poc-net
+
+  # Human-side test container: no proxy, no wrappers, direct access.
+  human-tester:
+    image: alpine:latest
+    container_name: full-human-tester
+    depends_on:
+      nexus-init:
+        condition: service_completed_successfully
+    volumes:
+      - ./certs/ca-cert.pem:/etc/ssl/certs/poc-ca.pem:ro
+      - ./test:/test:ro
+    entrypoint: ["/bin/sh", "-c", "apk add --no-cache curl >/dev/null 2>&1 && exec /bin/sh /test/human-tests.sh"]
+    networks:
+      - poc-net
+
+volumes:
+  nexus-data:
+
+networks:
+  poc-net:
+    driver: bridge

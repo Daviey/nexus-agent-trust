@@ -1,0 +1,37 @@
+{
+  "permissions": {
+    "deny": [
+      "Bash(npm install*)",
+      "Bash(npm i *)",
+      "Bash(npm i)",
+      "Bash(npm ci*)",
+      "Bash(npm add*)",
+      "Bash(pnpm install*)",
+      "Bash(pnpm add*)",
+      "Bash(yarn install*)",
+      "Bash(yarn add*)",
+      "Bash(pip install*)",
+      "Bash(pip3 install*)",
+      "Bash(uv pip*)",
+      "Bash(pipx install*)",
+      "Bash(go install*)",
+      "Bash(go get*)",
+      "Bash(go mod download*)",
+      "Bash(cargo add*)",
+      "Bash(cargo install*)",
+      "Bash(cargo build*)",
+      "Bash(docker pull*)",
+      "Bash(/usr/bin/npm install*)",
+      "Bash(/usr/local/bin/npm install*)"
+    ],
+    "allow": [
+      "Bash(npm-safe*)",
+      "Bash(pip-safe*)",
+      "Bash(go-safe*)",
+      "Bash(npm run*)",
+      "Bash(npm test*)",
+      "Bash(npm exec*)",
+      "Bash(npm ls*)"
+    ]
+  }
+}

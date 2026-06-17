@@ -1,0 +1,20 @@
+# Certificates generated for PoCs
+**/certs/*.pem
+**/certs/*.srl
+
+# Nexus data
+nexus-data/
+
+# Docker build artifacts
+**/target/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor files
+*.swp
+*.swo
+*~
+.vscode/
+.idea/

@@ -1,0 +1,41 @@
+services:
+  nexus:
+    image: sonatype/nexus3:latest
+    container_name: plugin-nexus
+    ports:
+      - "48081:8081"
+    volumes:
+      - nexus-data:/nexus-data
+    networks:
+      - poc-net
+
+  nexus-init:
+    image: alpine:latest
+    depends_on:
+      nexus:
+        condition: service_started
+    volumes:
+      - nexus-data:/nexus-data
+      - ./init:/init:ro
+      - ./port-gate.groovy:/scripts/port-gate.groovy:ro
+    entrypoint: ["/bin/sh", "-c", "apk add --no-cache curl jq >/dev/null 2>&1 && exec /bin/sh /init/setup-with-plugin.sh"]
+    networks:
+      - poc-net
+
+  tester:
+    image: alpine:latest
+    depends_on:
+      nexus-init:
+        condition: service_completed_successfully
+    volumes:
+      - ./test:/test:ro
+    entrypoint: ["/bin/sh", "-c", "apk add --no-cache curl >/dev/null 2>&1 && exec /bin/sh /test/run-tests.sh"]
+    networks:
+      - poc-net
+
+volumes:
+  nexus-data:
+
+networks:
+  poc-net:
+    driver: bridge

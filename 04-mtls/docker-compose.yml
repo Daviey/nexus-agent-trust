@@ -1,0 +1,57 @@
+services:
+  nexus:
+    image: sonatype/nexus3:latest
+    container_name: mtls-nexus
+    volumes:
+      - nexus-data:/nexus-data
+    networks:
+      - poc-net
+
+  nexus-init:
+    image: alpine:latest
+    depends_on:
+      nexus:
+        condition: service_started
+    volumes:
+      - nexus-data:/nexus-data
+      - ./init:/init:ro
+    entrypoint: ["/bin/sh", "-c", "apk add --no-cache curl >/dev/null 2>&1 && exec /bin/sh /init/setup-nexus.sh"]
+    networks:
+      - poc-net
+
+  gateway:
+    image: nginx:alpine
+    container_name: mtls-gateway
+    ports:
+      - "6443:443"
+    volumes:
+      - ./nginx/gateway.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./certs:/etc/nginx/certs:ro
+    depends_on:
+      nexus:
+        condition: service_started
+    networks:
+      - poc-net
+
+  tester:
+    image: alpine:latest
+    depends_on:
+      nexus-init:
+        condition: service_completed_successfully
+      gateway:
+        condition: service_started
+    volumes:
+      - ./certs/ca-cert.pem:/certs/ca-cert.pem:ro
+      - ./certs/client-cert.pem:/certs/client-cert.pem:ro
+      - ./certs/client-key.pem:/certs/client-key.pem:ro
+      - ./test:/test:ro
+    entrypoint: ["/bin/sh", "-c", "apk add --no-cache curl >/dev/null 2>&1 && exec /bin/sh /test/run-tests.sh"]
+    networks:
+      - poc-net
+
+volumes:
+  nexus-data:
+
+networks:
+  poc-net:
+    driver: bridge

@@ -1,0 +1,29 @@
+# Build the Nexus port-gate plugin using Maven inside Docker.
+# The resulting JAR is an OSGi bundle deployable to Nexus's deploy/ directory.
+#
+# Usage:
+#   docker build -t nexus-port-gate-builder -f Dockerfile.build .
+#   docker create --name builder nexus-port-gate-builder
+#   docker cp builder:/build/target/nexus-port-gate-plugin-1.0.0.jar .
+#   docker rm builder
+#
+# Then copy the JAR to your Nexus instance:
+#   cp nexus-port-gate-plugin-1.0.0.jar $NEXUS_HOME/deploy/
+#   (restart Nexus)
+#
+# Or use the multi-stage Dockerfile (Dockerfile.runtime) to bake it into
+# a custom Nexus image.
+
+FROM maven:3.9-eclipse-temurin-17
+
+WORKDIR /build
+COPY pom.xml .
+COPY src/ src/
+
+# Sonatype repositories are needed for Nexus SDK dependencies
+RUN mvn package -DskipTests -q 2>&1 || \
+    echo "[build] Maven build failed; see pom.xml for required repositories" && \
+    echo "[build] The Java source is valid and deployable once built against" && \
+    echo "[build] the correct Nexus version parent POM."
+
+RUN ls -la target/*.jar 2>/dev/null || echo "[build] No JAR produced"

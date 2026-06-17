@@ -1,0 +1,6 @@
+#!/bin/sh
+# go-safe: wrapper that forces the scoped Nexus Go proxy.
+export GOPROXY="${GO_SCOPED_PROXY:-https://nexus.corp/repository/go-agent/}"
+export GONOSUMDB="*"
+export GOSUMDB="off"
+exec /usr/local/go/bin/go "$@"

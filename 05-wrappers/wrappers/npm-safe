@@ -1,0 +1,14 @@
+#!/bin/sh
+# npm-safe: wrapper that forces the scoped Nexus registry.
+# Used by agent permission denylists as the only allowed way to run npm.
+# Sets npm_config_registry env var so all npm subcommands honor it,
+# including `config get registry`.
+export npm_config_registry="${NPM_SCOPED_REGISTRY:-https://nexus.corp/repository/npm-agent/}"
+# Find the real npm (not the wrapper itself)
+for candidate in /usr/local/bin/npm /usr/bin/npm "$(command -v npm 2>/dev/null)"; do
+    if [ -x "$candidate" ] && [ "$candidate" != "$0" ]; then
+        exec "$candidate" "$@"
+    fi
+done
+echo "npm-safe: real npm not found" >&2
+exit 1

@@ -1,0 +1,6 @@
+#!/bin/sh
+# pip-safe: wrapper that forces the scoped Nexus PyPI registry.
+exec /usr/bin/pip \
+    --index-url="${PIP_SCOPED_INDEX:-https://nexus.corp/repository/pypi-agent/simple}" \
+    --trusted-host="${PIP_SCOPED_HOST:-nexus.corp}" \
+    "$@"
