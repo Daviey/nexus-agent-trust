@@ -8,11 +8,11 @@ RUN yum install -y java-21-openjdk-devel 2>/dev/null || \
     microdnf install -y java-21-openjdk-devel 2>/dev/null || true
 
 # Create plugin source
-RUN mkdir -p /tmp/plugin/src/org/sonatype/nexus/plugins/portgate /tmp/plugin/build
+RUN mkdir -p /tmp/plugin/src/com/sonatype/nexus/plugins/portgate /tmp/plugin/build
 
 # PortGateConfig
-RUN cat > /tmp/plugin/src/org/sonatype/nexus/plugins/portgate/PortGateConfig.java << 'JAVA'
-package org.sonatype.nexus.plugins.portgate;
+RUN cat > /tmp/plugin/src/com/sonatype/nexus/plugins/portgate/PortGateConfig.java << 'JAVA'
+package com.sonatype.nexus.plugins.portgate;
 import java.util.*;
 import java.util.concurrent.atomic.AtomicReference;
 import javax.inject.Named;
@@ -44,8 +44,8 @@ public class PortGateConfig {
 }
 JAVA
 
-RUN cat > /tmp/plugin/src/org/sonatype/nexus/plugins/portgate/PortGateFilter.java << 'JAVA'
-package org.sonatype.nexus.plugins.portgate;
+RUN cat > /tmp/plugin/src/com/sonatype/nexus/plugins/portgate/PortGateFilter.java << 'JAVA'
+package com.sonatype.nexus.plugins.portgate;
 import java.io.IOException;
 import javax.inject.Inject;
 import javax.inject.Named;
@@ -80,8 +80,8 @@ public class PortGateFilter implements Filter {
 }
 JAVA
 
-RUN cat > /tmp/plugin/src/org/sonatype/nexus/plugins/portgate/PortGateCapability.java << 'JAVA'
-package org.sonatype.nexus.plugins.portgate;
+RUN cat > /tmp/plugin/src/com/sonatype/nexus/plugins/portgate/PortGateCapability.java << 'JAVA'
+package com.sonatype.nexus.plugins.portgate;
 import java.util.*;
 import javax.inject.Inject;
 import javax.inject.Named;
@@ -121,8 +121,8 @@ public class PortGateCapability extends CapabilitySupport<PortGateCapability.Con
 }
 JAVA
 
-RUN cat > /tmp/plugin/src/org/sonatype/nexus/plugins/portgate/PortGateCapabilityDescriptor.java << 'JAVA'
-package org.sonatype.nexus.plugins.portgate;
+RUN cat > /tmp/plugin/src/com/sonatype/nexus/plugins/portgate/PortGateCapabilityDescriptor.java << 'JAVA'
+package com.sonatype.nexus.plugins.portgate;
 import java.util.*;
 import javax.inject.Named;
 import javax.inject.Singleton;
@@ -173,14 +173,14 @@ RUN javac -cp "/tmp/cp:/tmp/cp/*" -d /tmp/plugin/build \
 
 # Create sisu discovery
 RUN mkdir -p /tmp/plugin/build/META-INF/sisu && \
-    printf "org.sonatype.nexus.plugins.portgate.PortGateFilter\norg.sonatype.nexus.plugins.portgate.PortGateConfig\norg.sonatype.nexus.plugins.portgate.PortGateCapability\norg.sonatype.nexus.plugins.portgate.PortGateCapabilityDescriptor\n" > /tmp/plugin/build/META-INF/sisu/javax.inject.Named
+    printf "com.sonatype.nexus.plugins.portgate.PortGateFilter\ncom.sonatype.nexus.plugins.portgate.PortGateConfig\ncom.sonatype.nexus.plugins.portgate.PortGateCapability\ncom.sonatype.nexus.plugins.portgate.PortGateCapabilityDescriptor\n" > /tmp/plugin/build/META-INF/sisu/javax.inject.Named
 
 # Inject into fat JAR under BOOT-INF/classes/
 RUN mkdir -p /tmp/inject/BOOT-INF/classes && \
     cp -r /tmp/plugin/build/* /tmp/inject/BOOT-INF/classes/ && \
     cd /tmp/inject && \
     jar uf /opt/sonatype/nexus/bin/sonatype-nexus-repository-*.jar \
-        BOOT-INF/classes/org \
+        BOOT-INF/classes/com \
         BOOT-INF/classes/META-INF/sisu/javax.inject.Named && \
     echo "Injected plugin into fat JAR"
 
