@@ -91,12 +91,14 @@ public class PortGateCapabilityDescriptor extends CapabilityDescriptorSupport {
 
         reposField = new ItemselectFormField(
             "enabledRepos", "Enabled repositories",
-            "Repositories enabled for agent access on the scoped port. " +
-            "Move repositories from Available to Selected to enable them.",
+            "Move repositories from Available to Enabled to allow agent access on the scoped port.",
             FormField.MANDATORY);
-        reposField.setStoreApi("coreui_Repository.list");
+        reposField.setStoreApi("coreui_Repository.read");
         reposField.setIdMapping("name");
         reposField.setNameMapping("name");
+        reposField.getAttributes().put("fromTitle", "Available");
+        reposField.getAttributes().put("toTitle", "Enabled");
+        reposField.getAttributes().put("buttons", java.util.List.of("add", "remove", "addAll", "removeAll"));
     }
 
     @Override public CapabilityType type() { return new CapabilityType(PortGateCapability.TYPE_ID); }
