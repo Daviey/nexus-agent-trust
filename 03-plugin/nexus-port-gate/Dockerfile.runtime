@@ -19,8 +19,9 @@ import org.slf4j.LoggerFactory;
  * Multi-port configuration holder. Each scoped port has its own allowlist
  * and audit mode flag. Thread-safe via ConcurrentHashMap.
  *
- * Deny-by-default: a registered port with zero enabled repos denies all
- * repository traffic (unless in audit mode).
+ * The port itself must be opened externally (Jetty connector config or
+ * a reverse proxy like nginx). The plugin only gates traffic that arrives
+ * on the configured port.
  */
 @Named
 @Singleton
@@ -225,6 +226,8 @@ public class PortGateFilter implements Filter {
 JAVA
 
 # ─── PortGateCapability ──────────────────────────────────────
+# Manages one scoped port: opens a Jetty connector on activation,
+# closes it on deactivation. No manual Jetty config needed.
 RUN cat > /tmp/src/com/sonatype/nexus/plugins/portgate/PortGateCapability.java << 'JAVA'
 package com.sonatype.nexus.plugins.portgate;
 
@@ -238,14 +241,15 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
- * Nexus Capability managing one scoped port.
+ * Nexus Capability managing one scoped port's allowlist.
+ *
+ * The port itself must be opened externally (Jetty connector or reverse
+ * proxy). The plugin gates traffic that arrives on the configured port.
  *
  * Properties:
  * - scopedPort: TCP port (default 8443)
  * - enabledRepos: comma-separated repo names from the itemselect picker
  * - auditMode: "true" or "false" from the checkbox
- *
- * Create multiple instances for different agent contexts.
  */
 @Named("agent-trust.port-gate")
 @Singleton
@@ -285,6 +289,7 @@ public class PortGateCapability extends CapabilitySupport<PortGateCapability.Cfg
     protected void onActivate(Cfg c) throws Exception {
         portGateConfig.update(c.scopedPort, c.allowedPrefixes, c.auditMode);
         log.info("Port-gate activated: port={} | {} repos | audit={}", c.scopedPort, c.allowedPrefixes.size(), c.auditMode);
+        log.info("Port-gate: ensure Nexus is listening on port {} (Jetty config or reverse proxy)", c.scopedPort);
     }
 
     @Override
