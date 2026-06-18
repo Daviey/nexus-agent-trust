@@ -12,12 +12,17 @@ import javax.inject.*; import org.slf4j.*;
 public class PortGateConfig {
     private static final Logger log = LoggerFactory.getLogger(PortGateConfig.class);
     private final AtomicReference<Snapshot> current = new AtomicReference<>(new Snapshot(false, 0, Collections.emptyList()));
-    void update(boolean e, int p, List<String> a) { current.set(new Snapshot(e, p, Collections.unmodifiableList(new ArrayList<>(a)))); log.info("Port-gate: port={}, {} paths", p, a.size()); }
+    void update(boolean e, int p, List<String> a) { current.set(new Snapshot(e, p, Collections.unmodifiableList(new ArrayList<>(a)))); log.info("Port-gate: port={}, {} repos", p, a.size()); }
     void clear() { current.set(new Snapshot(false, 0, Collections.emptyList())); }
     public boolean isEnabled() { return current.get().enabled; }
     public int getScopedPort() { return current.get().scopedPort; }
     public List<String> getAllowedPrefixes() { return current.get().allowedPrefixes; }
-    static List<String> parse(String r) { if(r==null||r.isBlank())return Collections.emptyList(); List<String>l=new ArrayList<>();for(String s:r.split("\n")){String t=s.trim();if(!t.isEmpty()&&!t.startsWith("#"))l.add(t);}return l; }
+    static List<String> parseRepos(String r) {
+        if (r == null || r.isBlank()) return Collections.emptyList();
+        List<String> l = new ArrayList<>();
+        for (String s : r.split(",")) { String t = s.trim(); if (!t.isEmpty()) l.add("/repository/" + t + "/"); }
+        return l;
+    }
     private static final class Snapshot { final boolean enabled; final int scopedPort; final List<String> allowedPrefixes; Snapshot(boolean e,int p,List<String> a){enabled=e;scopedPort=p;allowedPrefixes=a;} }
 }
 JAVA
@@ -55,7 +60,7 @@ public class PortGateCapability extends CapabilitySupport<PortGateCapability.Cfg
     @Inject public PortGateCapability(PortGateConfig c) { cfg = c; }
     @Override protected Cfg createConfig(Map<String,String> p) throws Exception {
         int port=8443; try{port=Integer.parseInt(p.getOrDefault("scopedPort","8443").trim());}catch(Exception e){}
-        return new Cfg(port, PortGateConfig.parse(p.getOrDefault("allowedPaths","")));
+        return new Cfg(port, PortGateConfig.parseRepos(p.getOrDefault("enabledRepos","")));
     }
     @Override protected void onUpdate(Cfg c) throws Exception { cfg.update(true,c.port,c.paths); }
     @Override protected void onActivate(Cfg c) throws Exception { cfg.update(true,c.port,c.paths); }
@@ -70,20 +75,38 @@ package com.sonatype.nexus.plugins.portgate;
 import java.util.*; import javax.inject.*;
 import org.sonatype.nexus.capability.*; import org.sonatype.nexus.formfields.*;
 import org.sonatype.nexus.common.upgrade.AvailabilityVersion;
+
 @AvailabilityVersion(from = "1.0")
 @Named("port-gate-descriptor") @Singleton
 public class PortGateCapabilityDescriptor extends CapabilityDescriptorSupport {
-    private final NumberTextFormField port; private final TextAreaFormField paths;
+    private final NumberTextFormField portField;
+    private final ItemselectFormField reposField;
+
     public PortGateCapabilityDescriptor() {
-        port = new NumberTextFormField("scopedPort","Scoped port","Agent traffic port.", FormField.MANDATORY);
-        port.withInitialValue(8443);
-        paths = new TextAreaFormField("allowedPaths","Allowed paths","One per line. # comments.", FormField.MANDATORY);
+        portField = new NumberTextFormField(
+            "scopedPort", "Scoped port",
+            "Nexus port that receives agent traffic.",
+            FormField.MANDATORY);
+        portField.withInitialValue(8443);
+
+        reposField = new ItemselectFormField(
+            "enabledRepos", "Enabled repositories",
+            "Repositories enabled for agent access on the scoped port. " +
+            "Move repositories from Available to Selected to enable them.",
+            FormField.MANDATORY);
+        reposField.setStoreApi("coreui_Repository.list");
+        reposField.setIdMapping("name");
+        reposField.setNameMapping("name");
     }
+
     @Override public CapabilityType type() { return new CapabilityType(PortGateCapability.TYPE_ID); }
     @Override public String name() { return "Agent Trust: Port Gate"; }
     @Override public int version() { return 1; }
-    @Override public String about() { return "Gates repository access on a scoped port."; }
-    @Override public List<FormField> formFields() { return List.of(port,paths); }
+    @Override public String about() {
+        return "Enable or disable individual repositories for agent access on a scoped port. " +
+               "Disabled repositories return 403 on the scoped port.";
+    }
+    @Override public List<FormField> formFields() { return List.of(portField, reposField); }
     @Override @SuppressWarnings("rawtypes") protected Object createConfig(Map p) { return p; }
 }
 JAVA
