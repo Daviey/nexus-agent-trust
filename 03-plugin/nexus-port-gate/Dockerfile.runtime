@@ -4,128 +4,498 @@ USER 0
 
 RUN mkdir -p /tmp/src/com/sonatype/nexus/plugins/portgate /tmp/build /tmp/cp
 
+# ─── PortGateConfig ──────────────────────────────────────────
+# Thread-safe holder for the port-gate configuration.
+# The Capability calls update() when config changes in the UI.
+# The Filter reads the current config on every request via getters.
+# No locking on the hot path: AtomicReference swap is the only sync point.
 RUN cat > /tmp/src/com/sonatype/nexus/plugins/portgate/PortGateConfig.java << 'JAVA'
 package com.sonatype.nexus.plugins.portgate;
-import java.util.*; import java.util.concurrent.atomic.AtomicReference;
-import javax.inject.*; import org.slf4j.*;
-@Named @Singleton
+
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+import java.util.concurrent.atomic.AtomicReference;
+import javax.inject.Named;
+import javax.inject.Singleton;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+/**
+ * Thread-safe configuration holder for the port-gate filter.
+ *
+ * <p>The capability lifecycle (onActivate/onUpdate/onPassivate) calls
+ * {@link #update} or {@link #clear} when the admin changes config in the
+ * Nexus UI. The servlet filter reads the current state on every request
+ * via the getter methods.
+ *
+ * <p>All state is wrapped in an immutable {@link Snapshot} and swapped
+ * atomically via {@link AtomicReference}. This means the filter never
+ * locks, never sees a half-updated config, and never needs to copy.
+ */
+@Named
+@Singleton
 public class PortGateConfig {
+
     private static final Logger log = LoggerFactory.getLogger(PortGateConfig.class);
-    private final AtomicReference<Snapshot> current = new AtomicReference<>(new Snapshot(false, 0, Collections.emptyList()));
-    void update(boolean e, int p, List<String> a) { current.set(new Snapshot(e, p, Collections.unmodifiableList(new ArrayList<>(a)))); log.info("Port-gate: port={}, {} repos", p, a.size()); }
-    void clear() { current.set(new Snapshot(false, 0, Collections.emptyList())); }
-    public boolean isEnabled() { return current.get().enabled; }
-    public int getScopedPort() { return current.get().scopedPort; }
-    public List<String> getAllowedPrefixes() { return current.get().allowedPrefixes; }
-    static List<String> parseRepos(String r) {
-        if (r == null || r.isBlank()) return Collections.emptyList();
-        List<String> l = new ArrayList<>();
-        for (String s : r.split(",")) { String t = s.trim(); if (!t.isEmpty()) l.add("/repository/" + t + "/"); }
-        return l;
+
+    /**
+     * Current config snapshot. Replaced atomically on every update.
+     * Initial state: disabled, port 0 (no traffic matches), empty allowlist.
+     */
+    private final AtomicReference<Snapshot> current =
+        new AtomicReference<>(new Snapshot(false, 0, Collections.emptyList()));
+
+    /**
+     * Called by the capability when config is saved or activated in the UI.
+     * Replaces the entire config atomically.
+     *
+     * @param enabled  whether the port-gate is active
+     * @param scopedPort  the TCP port that triggers allowlist checking
+     * @param allowedPrefixes  list of "/repository/<name>/" path prefixes
+     */
+    void update(boolean enabled, int scopedPort, List<String> allowedPrefixes) {
+        List<String> immutable = Collections.unmodifiableList(new ArrayList<>(allowedPrefixes));
+        current.set(new Snapshot(enabled, scopedPort, immutable));
+        log.info("Port-gate config updated: enabled={}, scopedPort={}, {} repository prefix(es)",
+            enabled, scopedPort, immutable.size());
     }
-    private static final class Snapshot { final boolean enabled; final int scopedPort; final List<String> allowedPrefixes; Snapshot(boolean e,int p,List<String> a){enabled=e;scopedPort=p;allowedPrefixes=a;} }
+
+    /**
+     * Called when the capability is disabled or removed.
+     * Resets to the default (disabled) state.
+     */
+    void clear() {
+        current.set(new Snapshot(false, 0, Collections.emptyList()));
+        log.info("Port-gate config cleared (capability disabled or removed)");
+    }
+
+    /** @return true if the port-gate is active and should enforce the allowlist */
+    public boolean isEnabled() {
+        return current.get().enabled;
+    }
+
+    /** @return the TCP port that triggers allowlist checking */
+    public int getScopedPort() {
+        return current.get().scopedPort;
+    }
+
+    /** @return unmodifiable list of allowed repository path prefixes */
+    public List<String> getAllowedPrefixes() {
+        return current.get().allowedPrefixes;
+    }
+
+    /**
+     * Parse the comma-separated repository names from the capability config
+     * into path prefixes. The itemselect form field stores selected repos
+     * as "repo-a,repo-b,repo-c". We convert each to "/repository/repo-a/".
+     *
+     * @param raw comma-separated repo names from the capability properties
+     * @return list of "/repository/<name>/" path prefixes
+     */
+    static List<String> parseRepos(String raw) {
+        if (raw == null || raw.isBlank()) {
+            return Collections.emptyList();
+        }
+        List<String> prefixes = new ArrayList<>();
+        for (String name : raw.split(",")) {
+            String trimmed = name.trim();
+            if (!trimmed.isEmpty()) {
+                prefixes.add("/repository/" + trimmed + "/");
+            }
+        }
+        return prefixes;
+    }
+
+    /**
+     * Immutable snapshot of the entire config.
+     * Swapped atomically so readers always see a consistent state.
+     */
+    private static final class Snapshot {
+        final boolean enabled;
+        final int scopedPort;
+        final List<String> allowedPrefixes;
+
+        Snapshot(boolean enabled, int scopedPort, List<String> allowedPrefixes) {
+            this.enabled = enabled;
+            this.scopedPort = scopedPort;
+            this.allowedPrefixes = allowedPrefixes;
+        }
+    }
 }
 JAVA
 
+# ─── PortGateFilter ──────────────────────────────────────────
+# Servlet filter that gates repository access based on the local TCP port.
+# On the scoped port, only allowlisted repositories are served.
+# Every request on the scoped port is logged for audit.
 RUN cat > /tmp/src/com/sonatype/nexus/plugins/portgate/PortGateFilter.java << 'JAVA'
 package com.sonatype.nexus.plugins.portgate;
-import java.io.IOException; import javax.inject.*; import javax.servlet.*; import javax.servlet.http.*; import org.slf4j.*;
-@Named @Singleton
+
+import java.io.IOException;
+import javax.inject.Inject;
+import javax.inject.Named;
+import javax.inject.Singleton;
+import javax.servlet.Filter;
+import javax.servlet.FilterChain;
+import javax.servlet.FilterConfig;
+import javax.servlet.ServletException;
+import javax.servlet.ServletRequest;
+import javax.servlet.ServletResponse;
+import javax.servlet.http.HttpServletRequest;
+import javax.servlet.http.HttpServletResponse;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+/**
+ * Servlet filter that gates repository access based on the local TCP port.
+ *
+ * <p>When a request arrives on the scoped port (configured via the Capability
+ * UI), only repositories in the allowlist are served. All other repository
+ * paths return HTTP 403.
+ *
+ * <p>Requests on any other port pass through unchanged (full access).
+ *
+ * <p>Every decision (allow or deny) on the scoped port is logged at INFO
+ * level for audit purposes:
+ * <pre>
+ *   Port-gate: ALLOW port=8443 path=/repository/maven-central/foo.jar
+ *   Port-gate: DENY  port=8443 path=/repository/npm-internal/express
+ * </pre>
+ */
+@Named
+@Singleton
 public class PortGateFilter implements Filter {
+
     private static final Logger log = LoggerFactory.getLogger(PortGateFilter.class);
+
     private final PortGateConfig config;
-    @Inject public PortGateFilter(PortGateConfig c) { config = c; }
-    public void init(FilterConfig f) { log.info("Port-gate filter ready"); }
-    public void doFilter(ServletRequest q, ServletResponse s, FilterChain c) throws IOException, ServletException {
-        int port = q.getLocalPort();
-        if (port == config.getScopedPort() && config.isEnabled()) {
-            String path = ((HttpServletRequest)q).getRequestURI();
-            for (String p : config.getAllowedPrefixes()) if (path.startsWith(p)) { c.doFilter(q,s); return; }
-            HttpServletResponse h = (HttpServletResponse)s; h.setStatus(403); h.setContentType("text/plain");
-            h.getWriter().write("Port-gate: denied on port "+port+" for "+path+"\n"); return;
-        }
-        c.doFilter(q,s);
+
+    /**
+     * @param config injected by Sisu; holds the current allowlist state
+     */
+    @Inject
+    public PortGateFilter(PortGateConfig config) {
+        this.config = config;
     }
-    public void destroy() {}
+
+    @Override
+    public void init(FilterConfig filterConfig) {
+        log.info("Port-gate filter initialised");
+    }
+
+    @Override
+    public void doFilter(ServletRequest request, ServletResponse response, FilterChain chain)
+            throws IOException, ServletException {
+
+        int localPort = request.getLocalPort();
+
+        // Only enforce on the scoped port, and only when the capability is enabled
+        if (localPort != config.getScopedPort() || !config.isEnabled()) {
+            chain.doFilter(request, response);
+            return;
+        }
+
+        HttpServletRequest httpRequest = (HttpServletRequest) request;
+        String path = httpRequest.getRequestURI();
+
+        // Check if the path starts with any allowed prefix
+        for (String prefix : config.getAllowedPrefixes()) {
+            if (path.startsWith(prefix)) {
+                log.info("Port-gate: ALLOW port={} path={}", localPort, path);
+                chain.doFilter(request, response);
+                return;
+            }
+        }
+
+        // Path not in allowlist: deny
+        log.info("Port-gate: DENY port={} path={}", localPort, path);
+        HttpServletResponse httpResponse = (HttpServletResponse) response;
+        httpResponse.setStatus(HttpServletResponse.SC_FORBIDDEN);
+        httpResponse.setContentType("text/plain");
+        httpResponse.getWriter().write(
+            "Port-gate: access denied on scoped port " + localPort
+            + " for " + path + "\n");
+    }
+
+    @Override
+    public void destroy() {
+        log.info("Port-gate filter destroyed");
+    }
 }
 JAVA
 
+# ─── PortGateCapability ──────────────────────────────────────
+# Nexus Capability that manages the port-gate lifecycle.
+# When enabled/configured in the UI, it pushes config to PortGateConfig.
+# When disabled/removed, it clears PortGateConfig.
 RUN cat > /tmp/src/com/sonatype/nexus/plugins/portgate/PortGateCapability.java << 'JAVA'
 package com.sonatype.nexus.plugins.portgate;
-import java.util.*; import javax.inject.*; import org.sonatype.nexus.capability.CapabilitySupport; import org.slf4j.*;
-@Named("agent-trust.port-gate") @Singleton
+
+import java.util.List;
+import java.util.Map;
+import javax.inject.Inject;
+import javax.inject.Named;
+import javax.inject.Singleton;
+import org.sonatype.nexus.capability.CapabilitySupport;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+/**
+ * Nexus Capability that manages the port-gate filter configuration.
+ *
+ * <p>This capability appears in the Nexus UI under
+ * {@code Administration > System > Capabilities > Agent Trust: Port Gate}.
+ *
+ * <p>Lifecycle:
+ * <ul>
+ *   <li>{@link #onActivate} - capability enabled: push config to the filter</li>
+ *   <li>{@link #onUpdate} - config changed in UI: push new config to the filter</li>
+ *   <li>{@link #onPassivate} - capability disabled: clear the filter config</li>
+ *   <li>{@link #onRemove} - capability deleted: clear the filter config</li>
+ * </ul>
+ *
+ * <p>Config is stored in the Nexus database and survives restarts.
+ * Changes take effect on the next request. No restart needed.
+ *
+ * <p>The capability has two properties:
+ * <ul>
+ *   <li>{@code scopedPort} - TCP port that triggers allowlist checking (default 8443)</li>
+ *   <li>{@code enabledRepos} - comma-separated repository names selected in the UI</li>
+ * </ul>
+ */
+@Named("agent-trust.port-gate")
+@Singleton
 public class PortGateCapability extends CapabilitySupport<PortGateCapability.Cfg> {
+
+    /** Capability type identifier used in the Nexus REST API and UI */
     public static final String TYPE_ID = "agent-trust.port-gate";
-    private final PortGateConfig cfg;
-    @Inject public PortGateCapability(PortGateConfig c) { cfg = c; }
-    @Override protected Cfg createConfig(Map<String,String> p) throws Exception {
-        int port=8443; try{port=Integer.parseInt(p.getOrDefault("scopedPort","8443").trim());}catch(Exception e){}
-        return new Cfg(port, PortGateConfig.parseRepos(p.getOrDefault("enabledRepos","")));
+
+    private static final Logger log = LoggerFactory.getLogger(PortGateCapability.class);
+
+    private static final int DEFAULT_SCOPED_PORT = 8443;
+
+    private final PortGateConfig portGateConfig;
+
+    @Inject
+    public PortGateCapability(PortGateConfig portGateConfig) {
+        this.portGateConfig = portGateConfig;
     }
-    @Override protected void onUpdate(Cfg c) throws Exception { cfg.update(true,c.port,c.paths); }
-    @Override protected void onActivate(Cfg c) throws Exception { cfg.update(true,c.port,c.paths); }
-    @Override protected void onPassivate(Cfg c) throws Exception { cfg.clear(); }
-    @Override protected void onRemove(Cfg c) throws Exception { cfg.clear(); }
-    static final class Cfg { final int port; final List<String> paths; Cfg(int p,List<String> a){port=p;paths=a;} }
+
+    /**
+     * Parse the raw capability properties into a typed config.
+     * Called by the framework before onActivate/onUpdate.
+     */
+    @Override
+    protected Cfg createConfig(Map<String, String> properties) throws Exception {
+        int scopedPort = DEFAULT_SCOPED_PORT;
+        try {
+            scopedPort = Integer.parseInt(
+                properties.getOrDefault("scopedPort", String.valueOf(DEFAULT_SCOPED_PORT)).trim());
+        } catch (NumberFormatException e) {
+            log.warn("Invalid scopedPort, using default {}", DEFAULT_SCOPED_PORT);
+        }
+
+        List<String> prefixes = PortGateConfig.parseRepos(
+            properties.getOrDefault("enabledRepos", ""));
+
+        return new Cfg(scopedPort, prefixes);
+    }
+
+    /** Config saved in the UI: push to the filter immediately */
+    @Override
+    protected void onUpdate(Cfg config) throws Exception {
+        portGateConfig.update(true, config.scopedPort, config.allowedPrefixes);
+        log.info("Port-gate updated via UI: scopedPort={}, {} repository prefix(es)",
+            config.scopedPort, config.allowedPrefixes.size());
+    }
+
+    /** Capability activated: push config to the filter */
+    @Override
+    protected void onActivate(Cfg config) throws Exception {
+        portGateConfig.update(true, config.scopedPort, config.allowedPrefixes);
+        log.info("Port-gate activated: scopedPort={}, {} repository prefix(es)",
+            config.scopedPort, config.allowedPrefixes.size());
+    }
+
+    /** Capability disabled: clear the filter so all traffic passes */
+    @Override
+    protected void onPassivate(Cfg config) throws Exception {
+        portGateConfig.clear();
+        log.info("Port-gate deactivated");
+    }
+
+    /** Capability deleted: clear the filter */
+    @Override
+    protected void onRemove(Cfg config) throws Exception {
+        portGateConfig.clear();
+        log.info("Port-gate removed");
+    }
+
+    /**
+     * Render the description shown in the capabilities list.
+     * Example: "Scoped port 8443 | 5 repository(s) enabled"
+     */
+    @Override
+    protected String renderDescription() {
+        Cfg cfg = getConfig();
+        if (cfg != null) {
+            return "Scoped port " + cfg.scopedPort
+                + " | " + cfg.allowedPrefixes.size() + " repository(s) enabled";
+        }
+        return "Not configured";
+    }
+
+    /** Parsed capability properties */
+    static final class Cfg {
+        final int scopedPort;
+        final List<String> allowedPrefixes;
+
+        Cfg(int scopedPort, List<String> allowedPrefixes) {
+            this.scopedPort = scopedPort;
+            this.allowedPrefixes = allowedPrefixes;
+        }
+    }
 }
 JAVA
 
+# ─── PortGateCapabilityDescriptor ───────────────────────────
+# Defines the capability type and its form fields shown in the Nexus UI.
+# Two fields: Scoped port (number) and Enabled repositories (item picker).
 RUN cat > /tmp/src/com/sonatype/nexus/plugins/portgate/PortGateCapabilityDescriptor.java << 'JAVA'
 package com.sonatype.nexus.plugins.portgate;
-import java.util.*; import javax.inject.*;
-import org.sonatype.nexus.capability.*; import org.sonatype.nexus.formfields.*;
-import org.sonatype.nexus.common.upgrade.AvailabilityVersion;
 
+import java.util.List;
+import java.util.Map;
+import javax.inject.Named;
+import javax.inject.Singleton;
+import org.sonatype.nexus.capability.CapabilityDescriptorSupport;
+import org.sonatype.nexus.capability.CapabilityType;
+import org.sonatype.nexus.common.upgrade.AvailabilityVersion;
+import org.sonatype.nexus.formfields.FormField;
+import org.sonatype.nexus.formfields.ItemselectFormField;
+import org.sonatype.nexus.formfields.NumberTextFormField;
+
+/**
+ * Descriptor for the Port-Gate capability.
+ *
+ * <p>Defines the form fields shown when creating or editing the capability
+ * in the Nexus UI (Administration > System > Capabilities).
+ *
+ * <p>Two form fields:
+ * <ul>
+ *   <li><b>Scoped port</b> (number): the TCP port that receives agent traffic.
+ *       Must match a second Jetty connector configured on the Nexus instance.</li>
+ *   <li><b>Enabled repositories</b> (itemselect): two-column picker listing all
+ *       Nexus repositories. Move repos from Available to Enabled to allow
+ *       agent access on the scoped port.</li>
+ * </ul>
+ *
+ * <p>The {@code @AvailabilityVersion} annotation is required by Nexus 3.78+
+ * to pass the {@code DatabaseCheckImpl.isAllowedByVersion()} check.
+ * Without it, the descriptor is silently rejected.
+ *
+ * <p>The {@code storeApi} uses {@code coreui_Repository.read} (ExtDirect
+ * {@code len:0}) rather than {@code readReferences} ({@code len:1}) because
+ * the itemselect widget calls the store with {@code data:null}, which only
+ * works with methods that accept zero parameters.
+ */
 @AvailabilityVersion(from = "1.0")
-@Named("port-gate-descriptor") @Singleton
+@Named("port-gate-descriptor")
+@Singleton
 public class PortGateCapabilityDescriptor extends CapabilityDescriptorSupport {
+
     private final NumberTextFormField portField;
     private final ItemselectFormField reposField;
 
     public PortGateCapabilityDescriptor() {
+        // Scoped port: numeric field, defaults to 8443
         portField = new NumberTextFormField(
-            "scopedPort", "Scoped port",
-            "Nexus port that receives agent traffic.",
+            "scopedPort",
+            "Scoped port",
+            "TCP port that receives agent traffic via the forward proxy. "
+            + "Must match the second Jetty connector. "
+            + "Requests on this port are checked against the repository allowlist.",
             FormField.MANDATORY);
         portField.withInitialValue(8443);
 
+        // Enabled repositories: two-column picker (Available / Enabled)
+        // Uses coreui_Repository.read (len:0) because itemselect sends data:null
         reposField = new ItemselectFormField(
-            "enabledRepos", "Enabled repositories",
-            "Move repositories from Available to Enabled to allow agent access on the scoped port.",
+            "enabledRepos",
+            "Enabled repositories",
+            "Repositories accessible to agents on the scoped port. "
+            + "Repositories left in Available are blocked (HTTP 403).",
             FormField.MANDATORY);
         reposField.setStoreApi("coreui_Repository.read");
         reposField.setIdMapping("name");
         reposField.setNameMapping("name");
-        reposField.getAttributes().put("fromTitle", "Available");
-        reposField.getAttributes().put("toTitle", "Enabled");
-        reposField.getAttributes().put("buttons", java.util.List.of("add", "remove", "addAll", "removeAll"));
+        reposField.getAttributes().put("fromTitle", "Available (blocked)");
+        reposField.getAttributes().put("toTitle", "Enabled (agent access)");
+        reposField.getAttributes().put("buttons",
+            java.util.List.of("add", "remove", "addAll", "removeAll"));
     }
 
-    @Override public CapabilityType type() { return new CapabilityType(PortGateCapability.TYPE_ID); }
-    @Override public String name() { return "Agent Trust: Port Gate"; }
-    @Override public int version() { return 1; }
-    @Override public String about() {
-        return "Enable or disable individual repositories for agent access on a scoped port. " +
-               "Disabled repositories return 403 on the scoped port.";
+    @Override
+    public CapabilityType type() {
+        return new CapabilityType(PortGateCapability.TYPE_ID);
     }
-    @Override public List<FormField> formFields() { return List.of(portField, reposField); }
-    @Override @SuppressWarnings("rawtypes") protected Object createConfig(Map p) { return p; }
+
+    @Override
+    public String name() {
+        return "Agent Trust: Port Gate";
+    }
+
+    @Override
+    public int version() {
+        return 1;
+    }
+
+    @Override
+    public String about() {
+        return "Controls which repositories AI agents can access on a scoped port. "
+            + "Only repositories moved to the Enabled column are served; "
+            + "all others return HTTP 403. Configure once per Nexus instance. "
+            + "Changes apply instantly without restart.";
+    }
+
+    @Override
+    public List<FormField> formFields() {
+        return List.of(portField, reposField);
+    }
+
+    /**
+     * Required by CapabilityDescriptorSupport but not used for this descriptor.
+     * Returns the raw properties map.
+     */
+    @Override
+    @SuppressWarnings("rawtypes")
+    protected Object createConfig(Map properties) {
+        return properties;
+    }
 }
 JAVA
 
-# Compile
+# Compile against the Nexus fat JAR classpath
 RUN cd /tmp/cp && jar xf /opt/sonatype/nexus/bin/sonatype-nexus-repository-*.jar BOOT-INF/lib && \
     cp BOOT-INF/lib/*.jar . && rm -rf BOOT-INF && \
     javac -cp "/tmp/cp/*" -d /tmp/build $(find /tmp/src -name '*.java') && \
     echo "Compiled $(find /tmp/build -name '*.class' | wc -l) classes"
 
-# Package
+# Package as a JAR with Sisu discovery file
+# The sisu file lists all @Named classes so Sisu/Spring can discover them
 RUN mkdir -p /tmp/build/META-INF/sisu && \
-    printf "com.sonatype.nexus.plugins.portgate.PortGateFilter\ncom.sonatype.nexus.plugins.portgate.PortGateConfig\ncom.sonatype.nexus.plugins.portgate.PortGateCapability\ncom.sonatype.nexus.plugins.portgate.PortGateCapabilityDescriptor\n" > /tmp/build/META-INF/sisu/javax.inject.Named && \
+    printf "%s\n%s\n%s\n%s\n" \
+        com.sonatype.nexus.plugins.portgate.PortGateFilter \
+        com.sonatype.nexus.plugins.portgate.PortGateConfig \
+        com.sonatype.nexus.plugins.portgate.PortGateCapability \
+        com.sonatype.nexus.plugins.portgate.PortGateCapabilityDescriptor \
+    > /tmp/build/META-INF/sisu/javax.inject.Named && \
     mkdir -p /opt/sonatype/nexus/plugins && \
     jar cf /opt/sonatype/nexus/plugins/port-gate-plugin.jar -C /tmp/build .
 
-# loader.properties
+# Spring Boot PropertiesLauncher: add the plugins directory to the classpath
+# Without this, the plugin JAR is not loaded and Spring won't discover the beans
 RUN printf "loader.path=BOOT-INF/classes,BOOT-INF/lib,/opt/sonatype/nexus/plugins\n" > /tmp/loader.properties && \
     cd /tmp && jar uf /opt/sonatype/nexus/bin/sonatype-nexus-repository-*.jar loader.properties
 
