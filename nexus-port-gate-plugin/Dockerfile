@@ -1,0 +1,650 @@
+FROM sonatype/nexus3:latest
+
+USER 0
+
+RUN mkdir -p /tmp/src/com/sonatype/nexus/plugins/portgate /tmp/build /tmp/cp
+
+# ─── PortGateFilterRegistrar ────────────────────────────────
+# Registers the filter via ServletContextListener.
+# Spring Boot auto-discovers ServletContextListener beans and calls
+# contextInitialized() before requests are served. This is the bridge
+# between the @Named filter bean and the servlet filter chain.
+RUN cat > /tmp/src/com/sonatype/nexus/plugins/portgate/PortGateFilterRegistrar.java << 'JAVA'
+package com.sonatype.nexus.plugins.portgate;
+
+import java.lang.reflect.Field;
+import java.lang.reflect.Method;
+import java.util.EnumSet;
+import javax.inject.Inject;
+import javax.inject.Named;
+import javax.inject.Singleton;
+import javax.servlet.DispatcherType;
+import javax.servlet.ServletContext;
+import javax.servlet.ServletContextEvent;
+import javax.servlet.ServletContextListener;
+import org.eclipse.jetty.server.Server;
+import org.eclipse.jetty.server.ServerConnector;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+/**
+ * Registers PortGateFilter AND opens the second Jetty connector.
+ *
+ * This ServletContextListener is called during servlet context initialization.
+ * At that point the Jetty Server is running but hasn't served requests yet.
+ * We access the Server via reflection (the ServletContext object is Jetty's
+ * ServletContextHandler.Context inner class, which has a this$0 reference
+ * to the handler, which has getServer()).
+ */
+@Named
+@Singleton
+public class PortGateFilterRegistrar implements ServletContextListener {
+
+    private static final Logger log = LoggerFactory.getLogger(PortGateFilterRegistrar.class);
+    private static final int DEFAULT_SCOPED_PORT = 8443;
+
+    private final PortGateFilter filter;
+
+    @Inject
+    public PortGateFilterRegistrar(PortGateFilter filter) {
+        this.filter = filter;
+    }
+
+    @Override
+    public void contextInitialized(ServletContextEvent sce) {
+        ServletContext ctx = sce.getServletContext();
+
+        // 1. Register the filter for /repository/*
+        try {
+            ctx.addFilter("port-gate-filter", filter)
+                .addMappingForUrlPatterns(EnumSet.of(DispatcherType.REQUEST), false, "/repository/*");
+            log.info("Port-gate filter registered for /repository/*");
+        } catch (Exception e) {
+            log.error("Port-gate: failed to register filter", e);
+        }
+
+        // 2. Open the second Jetty connector via reflection
+        int port = Integer.getInteger("portgate.port", DEFAULT_SCOPED_PORT);
+        try {
+            Server server = findJettyServer(ctx);
+            if (server != null) {
+                ServerConnector connector = new ServerConnector(server);
+                connector.setHost("0.0.0.0");
+                connector.setPort(port);
+                connector.setName("port-gate-" + port);
+                server.addConnector(connector);
+                connector.start();
+                log.info("Port-gate: opened Jetty connector on port {}", port);
+            } else {
+                log.warn("Port-gate: could not find Jetty Server, port {} not opened. " +
+                    "Configure it via Jetty XML or nginx.", port);
+            }
+        } catch (Exception e) {
+            log.error("Port-gate: failed to open connector on port {}", port, e);
+        }
+    }
+
+    /**
+     * Find the Jetty Server from the ServletContext via reflection.
+     * Jetty's ServletContext implementation is an inner class of
+     * ServletContextHandler. The this$0 field gives us the handler,
+     * which has getServer().
+     */
+    private Server findJettyServer(ServletContext ctx) {
+        try {
+            // Walk the class hierarchy looking for this$0
+            Class<?> cls = ctx.getClass();
+            while (cls != null) {
+                for (Field field : cls.getDeclaredFields()) {
+                    if (field.getName().equals("this$0")) {
+                        field.setAccessible(true);
+                        Object handler = field.get(ctx);
+                        if (handler != null) {
+                            Method getServer = handler.getClass().getMethod("getServer");
+                            Object server = getServer.invoke(handler);
+                            if (server instanceof Server) {
+                                log.info("Port-gate: found Jetty Server via {}", cls.getName());
+                                return (Server) server;
+                            }
+                        }
+                    }
+                }
+                cls = cls.getSuperclass();
+            }
+        } catch (Exception e) {
+            log.warn("Port-gate: reflection lookup for Jetty Server failed", e);
+        }
+        return null;
+    }
+
+    @Override
+    public void contextDestroyed(ServletContextEvent sce) {
+        log.info("Port-gate filter unregistered");
+    }
+}
+JAVA
+
+# ─── PortGateServerCustomizer ───────────────────────────────
+# Opens a second Jetty connector for agent traffic.
+# Reads the port from -Dportgate.port (default 8443).
+RUN cat > /tmp/src/com/sonatype/nexus/plugins/portgate/PortGateServerCustomizer.java << 'JAVA'
+package com.sonatype.nexus.plugins.portgate;
+
+import javax.inject.Named;
+import javax.inject.Singleton;
+import org.eclipse.jetty.server.ServerConnector;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.boot.web.embedded.jetty.JettyServerCustomizer;
+import org.springframework.boot.web.embedded.jetty.JettyServletWebServerFactory;
+import org.springframework.boot.web.server.WebServerFactoryCustomizer;
+
+/**
+ * Adds a second Jetty connector for agent traffic.
+ *
+ * Spring Boot discovers WebServerFactoryCustomizer beans and applies
+ * them before the web server starts. This customizer adds a connector
+ * on the port specified by -Dportgate.port (default 8443).
+ *
+ * The admin must set -Dportgate.port=8443 in nexus.vmoptions and
+ * configure the capability with the same port number.
+ */
+@Named
+@Singleton
+public class PortGateServerCustomizer
+        implements WebServerFactoryCustomizer<JettyServletWebServerFactory> {
+
+    private static final Logger log = LoggerFactory.getLogger(PortGateServerCustomizer.class);
+    private static final int DEFAULT_SCOPED_PORT = 8443;
+
+    @Override
+    public void customize(JettyServletWebServerFactory factory) {
+        int port = Integer.getInteger("portgate.port", DEFAULT_SCOPED_PORT);
+        log.info("Port-gate: adding Jetty connector on port {}", port);
+
+        factory.addServerCustomizers((JettyServerCustomizer) server -> {
+            ServerConnector connector = new ServerConnector(server);
+            connector.setHost("0.0.0.0");
+            connector.setPort(port);
+            connector.setName("port-gate-" + port);
+            server.addConnector(connector);
+            log.info("Port-gate: Jetty connector '{}' created on port {}", connector.getName(), port);
+        });
+    }
+}
+JAVA
+
+# ─── PortGateConfig ──────────────────────────────────────────
+RUN cat > /tmp/src/com/sonatype/nexus/plugins/portgate/PortGateConfig.java << 'JAVA'
+package com.sonatype.nexus.plugins.portgate;
+
+import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
+import javax.inject.Named;
+import javax.inject.Singleton;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+/**
+ * Multi-port configuration holder. Each scoped port has its own allowlist
+ * and audit mode flag. Thread-safe via ConcurrentHashMap.
+ *
+ * The port itself must be opened externally (Jetty connector config or
+ * a reverse proxy like nginx). The plugin only gates traffic that arrives
+ * on the configured port.
+ */
+@Named
+@Singleton
+public class PortGateConfig {
+
+    private static final Logger log = LoggerFactory.getLogger(PortGateConfig.class);
+
+    /** Per-port config: allowlist + audit flag */
+    private final ConcurrentHashMap<Integer, PortEntry> ports = new ConcurrentHashMap<>();
+
+    /** Immutable per-port configuration */
+    static final class PortEntry {
+        final List<String> allowedPrefixes;
+        final boolean auditMode;
+        final boolean readOnly;
+        PortEntry(List<String> prefixes, boolean auditMode, boolean readOnly) {
+            this.allowedPrefixes = List.copyOf(prefixes);
+            this.auditMode = auditMode;
+            this.readOnly = readOnly;
+        }
+    }
+
+    /** Register or update a scoped port */
+    void update(int scopedPort, List<String> prefixes, boolean auditMode, boolean readOnly) {
+        ports.put(scopedPort, new PortEntry(prefixes, auditMode, readOnly));
+        log.info("Port-gate: port={} | {} prefix(es) | audit={} | readOnly={}",
+            scopedPort, prefixes.size(), auditMode, readOnly);
+    }
+
+    /** Remove a scoped port (capability disabled or deleted) */
+    void remove(int scopedPort) {
+        ports.remove(scopedPort);
+        log.info("Port-gate: deregistered port {}", scopedPort);
+    }
+
+    /** Check if a port is under port-gate control */
+    public boolean isScopedPort(int port) {
+        return ports.containsKey(port);
+    }
+
+    /** Check if a port is in audit mode (log-only, no blocking) */
+    public boolean isAuditMode(int port) {
+        PortEntry entry = ports.get(port);
+        return entry != null && entry.auditMode;
+    }
+
+    /** Check if a port is in read-only mode (blocks writes) */
+    public boolean isReadOnly(int port) {
+        PortEntry entry = ports.get(port);
+        return entry != null && entry.readOnly;
+    }
+
+    /**
+     * Check if a path is allowed on a port.
+     * Returns true if port not gated, or if path matches an allowlist prefix.
+     * Returns false if deny-by-default (registered port, no matching prefix).
+     */
+    public boolean isAllowed(int port, String path) {
+        PortEntry entry = ports.get(port);
+        if (entry == null) return true;
+        for (String prefix : entry.allowedPrefixes) {
+            if (path.startsWith(prefix)) return true;
+        }
+        return false;
+    }
+
+    /** Snapshot of all ports for logging/status */
+    public Map<Integer, String> getPortSummary() {
+        Map<Integer, String> summary = new TreeMap<>();
+        ports.forEach((port, entry) ->
+            summary.put(port, entry.allowedPrefixes.size() + " repos, audit=" + entry.auditMode));
+        return summary;
+    }
+
+    /** Parse comma-separated repo names into "/repository/name/" prefixes */
+    static List<String> parseRepos(String raw) {
+        if (raw == null || raw.isBlank()) return List.of();
+        List<String> prefixes = new ArrayList<>();
+        for (String name : raw.split(",")) {
+            String t = name.trim();
+            if (!t.isEmpty()) prefixes.add("/repository/" + t + "/");
+        }
+        return prefixes;
+    }
+}
+JAVA
+
+# ─── PortGateFilter ──────────────────────────────────────────
+# In audit mode: logs what WOULD be denied but lets everything through.
+# In enforce mode: blocks denied requests with HTTP 403.
+RUN cat > /tmp/src/com/sonatype/nexus/plugins/portgate/PortGateFilter.java << 'JAVA'
+package com.sonatype.nexus.plugins.portgate;
+
+import java.io.IOException;
+import javax.inject.Inject;
+import javax.inject.Named;
+import javax.inject.Singleton;
+import javax.servlet.Filter;
+import javax.servlet.FilterChain;
+import javax.servlet.FilterConfig;
+import javax.servlet.ServletException;
+import javax.servlet.ServletRequest;
+import javax.servlet.ServletResponse;
+import javax.servlet.http.HttpServletRequest;
+import javax.servlet.http.HttpServletResponse;
+import org.apache.shiro.subject.Subject;
+import org.apache.shiro.SecurityUtils;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+/**
+ * Servlet filter that gates repository access on scoped ports.
+ *
+ * Two modes per port:
+ * - Enforce (default): denied requests return HTTP 403
+ * - Audit: denied requests are logged but allowed through (dry-run)
+ *
+ * Audit mode is useful for testing the allowlist before switching to
+ * enforcement. Monitor the logs to see what would be blocked:
+ *   grep "AUDIT-DENY" nexus.log
+ *
+ * Every decision is logged:
+ *   Port-gate: ALLOW     port=8443 user=admin ip=10.0.0.5 path=...
+ *   Port-gate: DENY      port=8443 user=admin ip=10.0.0.5 path=...
+ *   Port-gate: AUDIT-DENY port=8443 user=admin ip=10.0.0.5 path=...
+ */
+@Named
+@Singleton
+public class PortGateFilter implements Filter {
+
+    private static final Logger log = LoggerFactory.getLogger(PortGateFilter.class);
+    private final PortGateConfig config;
+
+    @Inject
+    public PortGateFilter(PortGateConfig config) {
+        this.config = config;
+    }
+
+    @Override
+    public void init(FilterConfig filterConfig) {
+        log.info("Port-gate filter initialised");
+    }
+
+    @Override
+    public void doFilter(ServletRequest request, ServletResponse response, FilterChain chain)
+            throws IOException, ServletException {
+
+        int localPort = request.getLocalPort();
+
+        if (!config.isScopedPort(localPort)) {
+            chain.doFilter(request, response);
+            return;
+        }
+
+        HttpServletRequest httpRequest = (HttpServletRequest) request;
+        String path = httpRequest.getRequestURI();
+
+        // Only gate repository artifact access, not API/UI/admin requests
+        if (!path.startsWith("/repository/")) {
+            chain.doFilter(request, response);
+            return;
+        }
+
+        String method = httpRequest.getMethod();
+        String user = getUser();
+        String ip = getClientIp(request);
+
+        // Read-only check: block write operations on read-only ports
+        boolean isWrite = "POST".equals(method) || "PUT".equals(method)
+            || "DELETE".equals(method) || "PATCH".equals(method);
+
+        if (config.isReadOnly(localPort) && isWrite) {
+            if (config.isAuditMode(localPort)) {
+                log.warn("Port-gate: AUDIT-DENY port={} user={} ip={} method={} path={} (write blocked by read-only mode)",
+                    localPort, user, ip, method, path);
+                chain.doFilter(request, response);
+            } else {
+                log.warn("Port-gate: DENY port={} user={} ip={} method={} path={} (write blocked by read-only mode)",
+                    localPort, user, ip, method, path);
+                HttpServletResponse httpResponse = (HttpServletResponse) response;
+                httpResponse.setStatus(HttpServletResponse.SC_FORBIDDEN);
+                httpResponse.setContentType("text/plain");
+                httpResponse.getWriter().write(
+                    "Port-gate: write operations blocked on port " + localPort + " (read-only mode)\n");
+            }
+            return;
+        }
+
+        // Allowlist check for all requests
+        if (config.isAllowed(localPort, path)) {
+            log.info("Port-gate: ALLOW port={} user={} ip={} path={}", localPort, user, ip, path);
+            chain.doFilter(request, response);
+            return;
+        }
+
+        // Path not in allowlist
+        if (config.isAuditMode(localPort)) {
+            // Audit mode: log what would be denied, but let it through
+            log.warn("Port-gate: AUDIT-DENY port={} user={} ip={} path={} (would be blocked in enforce mode)",
+                localPort, user, ip, path);
+            chain.doFilter(request, response);
+        } else {
+            // Enforce mode: block the request
+            log.warn("Port-gate: DENY port={} user={} ip={} path={}", localPort, user, ip, path);
+            HttpServletResponse httpResponse = (HttpServletResponse) response;
+            httpResponse.setStatus(HttpServletResponse.SC_FORBIDDEN);
+            httpResponse.setContentType("text/plain");
+            httpResponse.getWriter().write(
+                "Port-gate: access denied on port " + localPort + " for " + path + "\n");
+        }
+    }
+
+    private String getUser() {
+        try {
+            Subject subject = SecurityUtils.getSubject();
+            return subject != null && subject.getPrincipal() != null
+                ? subject.getPrincipal().toString() : "anonymous";
+        } catch (Exception e) {
+            return "unknown";
+        }
+    }
+
+    private String getClientIp(ServletRequest request) {
+        try {
+            HttpServletRequest http = (HttpServletRequest) request;
+            String forwarded = http.getHeader("X-Forwarded-For");
+            if (forwarded != null && !forwarded.isBlank()) {
+                return forwarded.split(",")[0].trim();
+            }
+            return request.getRemoteAddr();
+        } catch (Exception e) {
+            return "unknown";
+        }
+    }
+
+    @Override
+    public void destroy() {
+        log.info("Port-gate filter destroyed. Ports: {}", config.getPortSummary());
+    }
+}
+JAVA
+
+# ─── PortGateCapability ──────────────────────────────────────
+# Manages one scoped port: opens a Jetty connector on activation,
+# closes it on deactivation. No manual Jetty config needed.
+RUN cat > /tmp/src/com/sonatype/nexus/plugins/portgate/PortGateCapability.java << 'JAVA'
+package com.sonatype.nexus.plugins.portgate;
+
+import java.util.List;
+import java.util.Map;
+import javax.inject.Inject;
+import javax.inject.Named;
+import javax.inject.Singleton;
+import org.sonatype.nexus.capability.CapabilitySupport;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+/**
+ * Nexus Capability managing one scoped port's allowlist.
+ *
+ * The port itself must be opened externally (Jetty connector or reverse
+ * proxy). The plugin gates traffic that arrives on the configured port.
+ *
+ * Properties:
+ * - scopedPort: TCP port (default 8443)
+ * - enabledRepos: comma-separated repo names from the itemselect picker
+ * - auditMode: "true" or "false" from the checkbox
+ */
+@Named("agent-trust.port-gate")
+@Singleton
+public class PortGateCapability extends CapabilitySupport<PortGateCapability.Cfg> {
+
+    public static final String TYPE_ID = "agent-trust.port-gate";
+    private static final Logger log = LoggerFactory.getLogger(PortGateCapability.class);
+    private static final int DEFAULT_PORT = 8443;
+
+    private final PortGateConfig portGateConfig;
+
+    @Inject
+    public PortGateCapability(PortGateConfig portGateConfig) {
+        this.portGateConfig = portGateConfig;
+    }
+
+    @Override
+    protected Cfg createConfig(Map<String, String> p) throws Exception {
+        int port = DEFAULT_PORT;
+        try {
+            port = Integer.parseInt(p.getOrDefault("scopedPort", String.valueOf(DEFAULT_PORT)).trim());
+        } catch (NumberFormatException e) {
+            log.warn("Invalid scopedPort, using default {}", DEFAULT_PORT);
+        }
+        boolean audit = Boolean.parseBoolean(p.getOrDefault("auditMode", "false"));
+        boolean readOnly = Boolean.parseBoolean(p.getOrDefault("readOnly", "false"));
+        List<String> prefixes = PortGateConfig.parseRepos(p.getOrDefault("enabledRepos", ""));
+        return new Cfg(port, prefixes, audit, readOnly);
+    }
+
+    @Override
+    protected void onUpdate(Cfg c) throws Exception {
+        portGateConfig.update(c.scopedPort, c.allowedPrefixes, c.auditMode, c.readOnly);
+        log.info("Port-gate updated: port={} | {} repos | audit={} | readOnly={}", c.scopedPort, c.allowedPrefixes.size(), c.auditMode, c.readOnly);
+    }
+
+    @Override
+    protected void onActivate(Cfg c) throws Exception {
+        portGateConfig.update(c.scopedPort, c.allowedPrefixes, c.auditMode, c.readOnly);
+        log.info("Port-gate activated: port={} | {} repos | audit={} | readOnly={}", c.scopedPort, c.allowedPrefixes.size(), c.auditMode, c.readOnly);
+        log.info("Port-gate: ensure Nexus is listening on port {} (Jetty config or reverse proxy)", c.scopedPort);
+    }
+
+    @Override
+    protected void onPassivate(Cfg c) throws Exception {
+        portGateConfig.remove(c.scopedPort);
+        log.info("Port-gate deactivated: port={}", c.scopedPort);
+    }
+
+    @Override
+    protected void onRemove(Cfg c) throws Exception {
+        portGateConfig.remove(c.scopedPort);
+        log.info("Port-gate removed: port={}", c.scopedPort);
+    }
+
+    @Override
+    protected String renderDescription() {
+        Cfg c = getConfig();
+        if (c == null) return "Not configured";
+        return "Port " + c.scopedPort + " | " + c.allowedPrefixes.size() + " repo(s)"
+            + (c.auditMode ? " | AUDIT" : "") + (c.readOnly ? " | READ-ONLY" : "");
+    }
+
+    static final class Cfg {
+        final int scopedPort;
+        final List<String> allowedPrefixes;
+        final boolean auditMode;
+        final boolean readOnly;
+        Cfg(int port, List<String> prefixes, boolean audit, boolean readOnly) {
+            this.scopedPort = port;
+            this.allowedPrefixes = prefixes;
+            this.auditMode = audit;
+            this.readOnly = readOnly;
+        }
+    }
+}
+JAVA
+
+# ─── PortGateCapabilityDescriptor ───────────────────────────
+RUN cat > /tmp/src/com/sonatype/nexus/plugins/portgate/PortGateCapabilityDescriptor.java << 'JAVA'
+package com.sonatype.nexus.plugins.portgate;
+
+import java.util.List;
+import java.util.Map;
+import javax.inject.Named;
+import javax.inject.Singleton;
+import org.sonatype.nexus.capability.CapabilityDescriptorSupport;
+import org.sonatype.nexus.capability.CapabilityType;
+import org.sonatype.nexus.common.upgrade.AvailabilityVersion;
+import org.sonatype.nexus.formfields.CheckboxFormField;
+import org.sonatype.nexus.formfields.FormField;
+import org.sonatype.nexus.formfields.ItemselectFormField;
+import org.sonatype.nexus.formfields.NumberTextFormField;
+
+/**
+ * Form descriptor with three fields:
+ * 1. Scoped port (number)
+ * 2. Enabled repositories (itemselect picker)
+ * 3. Audit mode (checkbox: log-only dry-run)
+ */
+@AvailabilityVersion(from = "1.0")
+@Named("port-gate-descriptor")
+@Singleton
+public class PortGateCapabilityDescriptor extends CapabilityDescriptorSupport {
+
+    private final NumberTextFormField portField;
+    private final ItemselectFormField reposField;
+    private final CheckboxFormField auditField;
+    private final CheckboxFormField readOnlyField;
+
+    public PortGateCapabilityDescriptor() {
+        portField = new NumberTextFormField(
+            "scopedPort", "Scoped port",
+            "TCP port for agent traffic. Each capability instance manages one port. "
+            + "Create separate instances for different agent contexts (e.g. CI vs dev). "
+            + "Must match a Jetty connector on this Nexus instance.",
+            FormField.MANDATORY);
+        portField.withInitialValue(8443);
+
+        reposField = new ItemselectFormField(
+            "enabledRepos", "Enabled repositories",
+            "Repositories accessible to agents on this port. "
+            + "Repositories left in Available are blocked (HTTP 403 in enforce mode). "
+            + "If zero repos are enabled, ALL requests on this port are denied.",
+            FormField.MANDATORY);
+        reposField.setStoreApi("coreui_Repository.read");
+        reposField.setIdMapping("name");
+        reposField.setNameMapping("name");
+        reposField.getAttributes().put("fromTitle", "Available (blocked)");
+        reposField.getAttributes().put("toTitle", "Enabled (agent access)");
+        reposField.getAttributes().put("buttons", java.util.List.of("add", "remove", "addAll", "removeAll"));
+
+        auditField = new CheckboxFormField(
+            "auditMode", "Audit mode (log only)",
+            "When checked, the port-gate logs what it WOULD deny but allows all requests through. "
+            + "Use this to test your allowlist before switching to enforcement. "
+            + "Monitor logs with: grep AUDIT-DENY nexus.log",
+            FormField.OPTIONAL);
+
+        readOnlyField = new CheckboxFormField(
+            "readOnly", "Read-only mode (block writes)",
+            "When checked, agents can download from enabled repositories but cannot upload, "
+            + "publish, or delete artifacts. POST, PUT, DELETE, and PATCH methods are blocked "
+            + "with HTTP 403. GET and HEAD are unaffected.",
+            FormField.OPTIONAL);
+    }
+
+    @Override public CapabilityType type() { return new CapabilityType(PortGateCapability.TYPE_ID); }
+    @Override public String name() { return "Agent Trust: Port Gate"; }
+    @Override public int version() { return 4; }
+    @Override public String about() {
+        return "Controls which repositories AI agents can access on a scoped port. "
+            + "Audit mode logs without blocking. Read-only mode blocks uploads and deletes. "
+            + "Create multiple instances for different agent contexts. "
+            + "Changes apply instantly without restart.";
+    }
+    @Override public List<FormField> formFields() {
+        return List.of(portField, reposField, auditField, readOnlyField);
+    }
+    @Override @SuppressWarnings("rawtypes") protected Object createConfig(Map p) { return p; }
+}
+JAVA
+
+# Compile
+RUN cd /tmp/cp && jar xf /opt/sonatype/nexus/bin/sonatype-nexus-repository-*.jar BOOT-INF/lib && \
+    cp BOOT-INF/lib/*.jar . && rm -rf BOOT-INF && \
+    javac -cp "/tmp/cp/*" -d /tmp/build $(find /tmp/src -name '*.java') && \
+    echo "Compiled $(find /tmp/build -name '*.class' | wc -l) classes"
+
+# Package
+RUN mkdir -p /tmp/build/META-INF/sisu && \
+    printf "%s\n%s\n%s\n%s\n%s\n%s\n" \
+        com.sonatype.nexus.plugins.portgate.PortGateFilter \
+        com.sonatype.nexus.plugins.portgate.PortGateFilterRegistrar \
+        com.sonatype.nexus.plugins.portgate.PortGateConfig \
+        com.sonatype.nexus.plugins.portgate.PortGateCapability \
+        com.sonatype.nexus.plugins.portgate.PortGateCapabilityDescriptor \
+        com.sonatype.nexus.plugins.portgate.PortGateServerCustomizer \
+    > /tmp/build/META-INF/sisu/javax.inject.Named && \
+    mkdir -p /opt/sonatype/nexus/plugins && \
+    jar cf /opt/sonatype/nexus/plugins/port-gate-plugin.jar -C /tmp/build .
+
+# loader.properties
+RUN printf "loader.path=BOOT-INF/classes,BOOT-INF/lib,/opt/sonatype/nexus/plugins\n" > /tmp/loader.properties && \
+    cd /tmp && jar uf /opt/sonatype/nexus/bin/sonatype-nexus-repository-*.jar loader.properties
+
+RUN chown -R nexus:nexus /nexus-data && rm -rf /tmp/*
+
+USER nexus
