@@ -4,6 +4,119 @@ USER 0
 
 RUN mkdir -p /tmp/src/com/sonatype/nexus/plugins/portgate /tmp/build /tmp/cp
 
+# ─── PortGateFilterRegistrar ────────────────────────────────
+# Registers the filter via ServletContextListener.
+# Spring Boot auto-discovers ServletContextListener beans and calls
+# contextInitialized() before requests are served. This is the bridge
+# between the @Named filter bean and the servlet filter chain.
+RUN cat > /tmp/src/com/sonatype/nexus/plugins/portgate/PortGateFilterRegistrar.java << 'JAVA'
+package com.sonatype.nexus.plugins.portgate;
+
+import java.util.EnumSet;
+import javax.inject.Inject;
+import javax.inject.Named;
+import javax.inject.Singleton;
+import javax.servlet.DispatcherType;
+import javax.servlet.ServletContextEvent;
+import javax.servlet.ServletContextListener;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+/**
+ * Registers PortGateFilter in the servlet filter chain.
+ *
+ * Uses ServletContextListener because Spring Boot 3.x's
+ * FilterRegistrationBean references jakarta.servlet which Nexus
+ * doesn't have (it uses javax.servlet).
+ *
+ * The listener is discovered by Spring component scan (@Named) and
+ * called during servlet context initialization, before any requests
+ * are served. It adds the filter for /repository/* URL pattern.
+ */
+@Named
+@Singleton
+public class PortGateFilterRegistrar implements ServletContextListener {
+
+    private static final Logger log = LoggerFactory.getLogger(PortGateFilterRegistrar.class);
+
+    private final PortGateFilter filter;
+
+    @Inject
+    public PortGateFilterRegistrar(PortGateFilter filter) {
+        this.filter = filter;
+    }
+
+    @Override
+    public void contextInitialized(ServletContextEvent sce) {
+        try {
+            sce.getServletContext().addFilter("port-gate-filter", filter)
+                .addMappingForUrlPatterns(
+                    EnumSet.of(DispatcherType.REQUEST),
+                    false,
+                    "/repository/*");
+            log.info("Port-gate filter registered for /repository/*");
+        } catch (Exception e) {
+            log.error("Port-gate: failed to register filter", e);
+        }
+    }
+
+    @Override
+    public void contextDestroyed(ServletContextEvent sce) {
+        log.info("Port-gate filter unregistered");
+    }
+}
+JAVA
+
+# ─── PortGateServerCustomizer ───────────────────────────────
+# Opens a second Jetty connector for agent traffic.
+# Reads the port from -Dportgate.port (default 8443).
+RUN cat > /tmp/src/com/sonatype/nexus/plugins/portgate/PortGateServerCustomizer.java << 'JAVA'
+package com.sonatype.nexus.plugins.portgate;
+
+import javax.inject.Named;
+import javax.inject.Singleton;
+import org.eclipse.jetty.server.ServerConnector;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.boot.web.embedded.jetty.JettyServerCustomizer;
+import org.springframework.boot.web.embedded.jetty.JettyServletWebServerFactory;
+import org.springframework.boot.web.server.WebServerFactoryCustomizer;
+
+/**
+ * Adds a second Jetty connector for agent traffic.
+ *
+ * Spring Boot discovers WebServerFactoryCustomizer beans and applies
+ * them before the web server starts. This customizer adds a connector
+ * on the port specified by -Dportgate.port (default 8443).
+ *
+ * The admin must set -Dportgate.port=8443 in nexus.vmoptions and
+ * configure the capability with the same port number.
+ */
+@Named
+@Singleton
+public class PortGateServerCustomizer
+        implements WebServerFactoryCustomizer<JettyServletWebServerFactory> {
+
+    private static final Logger log = LoggerFactory.getLogger(PortGateServerCustomizer.class);
+    private static final int DEFAULT_SCOPED_PORT = 8443;
+
+    @Override
+    public void customize(JettyServletWebServerFactory factory) {
+        int port = Integer.getInteger("portgate.port", DEFAULT_SCOPED_PORT);
+        log.info("Port-gate: adding Jetty connector on port {}", port);
+
+        factory.addServerCustomizers((JettyServerCustomizer) server -> {
+            ServerConnector connector = new ServerConnector(server);
+            connector.setHost("0.0.0.0");
+            connector.setPort(port);
+            connector.setName("port-gate-" + port);
+            server.addConnector(connector);
+            log.info("Port-gate: Jetty connector '{}' created on port {}", connector.getName(), port);
+        });
+    }
+}
+JAVA
+
 # ─── PortGateConfig ──────────────────────────────────────────
 RUN cat > /tmp/src/com/sonatype/nexus/plugins/portgate/PortGateConfig.java << 'JAVA'
 package com.sonatype.nexus.plugins.portgate;
@@ -178,6 +291,13 @@ public class PortGateFilter implements Filter {
 
         HttpServletRequest httpRequest = (HttpServletRequest) request;
         String path = httpRequest.getRequestURI();
+
+        // Only gate repository artifact access, not API/UI/admin requests
+        if (!path.startsWith("/repository/")) {
+            chain.doFilter(request, response);
+            return;
+        }
+
         String method = httpRequest.getMethod();
         String user = getUser();
         String ip = getClientIp(request);
@@ -453,11 +573,13 @@ RUN cd /tmp/cp && jar xf /opt/sonatype/nexus/bin/sonatype-nexus-repository-*.jar
 
 # Package
 RUN mkdir -p /tmp/build/META-INF/sisu && \
-    printf "%s\n%s\n%s\n%s\n" \
+    printf "%s\n%s\n%s\n%s\n%s\n%s\n" \
         com.sonatype.nexus.plugins.portgate.PortGateFilter \
+        com.sonatype.nexus.plugins.portgate.PortGateFilterRegistrar \
         com.sonatype.nexus.plugins.portgate.PortGateConfig \
         com.sonatype.nexus.plugins.portgate.PortGateCapability \
         com.sonatype.nexus.plugins.portgate.PortGateCapabilityDescriptor \
+        com.sonatype.nexus.plugins.portgate.PortGateServerCustomizer \
     > /tmp/build/META-INF/sisu/javax.inject.Named && \
     mkdir -p /opt/sonatype/nexus/plugins && \
     jar cf /opt/sonatype/nexus/plugins/port-gate-plugin.jar -C /tmp/build .
