@@ -36,16 +36,19 @@ public class PortGateConfig {
     static final class PortEntry {
         final List<String> allowedPrefixes;
         final boolean auditMode;
-        PortEntry(List<String> prefixes, boolean auditMode) {
+        final boolean readOnly;
+        PortEntry(List<String> prefixes, boolean auditMode, boolean readOnly) {
             this.allowedPrefixes = List.copyOf(prefixes);
             this.auditMode = auditMode;
+            this.readOnly = readOnly;
         }
     }
 
     /** Register or update a scoped port */
-    void update(int scopedPort, List<String> prefixes, boolean auditMode) {
-        ports.put(scopedPort, new PortEntry(prefixes, auditMode));
-        log.info("Port-gate: port={} | {} prefix(es) | audit={}", scopedPort, prefixes.size(), auditMode);
+    void update(int scopedPort, List<String> prefixes, boolean auditMode, boolean readOnly) {
+        ports.put(scopedPort, new PortEntry(prefixes, auditMode, readOnly));
+        log.info("Port-gate: port={} | {} prefix(es) | audit={} | readOnly={}",
+            scopedPort, prefixes.size(), auditMode, readOnly);
     }
 
     /** Remove a scoped port (capability disabled or deleted) */
@@ -63,6 +66,12 @@ public class PortGateConfig {
     public boolean isAuditMode(int port) {
         PortEntry entry = ports.get(port);
         return entry != null && entry.auditMode;
+    }
+
+    /** Check if a port is in read-only mode (blocks writes) */
+    public boolean isReadOnly(int port) {
+        PortEntry entry = ports.get(port);
+        return entry != null && entry.readOnly;
     }
 
     /**
@@ -169,9 +178,32 @@ public class PortGateFilter implements Filter {
 
         HttpServletRequest httpRequest = (HttpServletRequest) request;
         String path = httpRequest.getRequestURI();
+        String method = httpRequest.getMethod();
         String user = getUser();
         String ip = getClientIp(request);
 
+        // Read-only check: block write operations on read-only ports
+        boolean isWrite = "POST".equals(method) || "PUT".equals(method)
+            || "DELETE".equals(method) || "PATCH".equals(method);
+
+        if (config.isReadOnly(localPort) && isWrite) {
+            if (config.isAuditMode(localPort)) {
+                log.warn("Port-gate: AUDIT-DENY port={} user={} ip={} method={} path={} (write blocked by read-only mode)",
+                    localPort, user, ip, method, path);
+                chain.doFilter(request, response);
+            } else {
+                log.warn("Port-gate: DENY port={} user={} ip={} method={} path={} (write blocked by read-only mode)",
+                    localPort, user, ip, method, path);
+                HttpServletResponse httpResponse = (HttpServletResponse) response;
+                httpResponse.setStatus(HttpServletResponse.SC_FORBIDDEN);
+                httpResponse.setContentType("text/plain");
+                httpResponse.getWriter().write(
+                    "Port-gate: write operations blocked on port " + localPort + " (read-only mode)\n");
+            }
+            return;
+        }
+
+        // Allowlist check for all requests
         if (config.isAllowed(localPort, path)) {
             log.info("Port-gate: ALLOW port={} user={} ip={} path={}", localPort, user, ip, path);
             chain.doFilter(request, response);
@@ -275,20 +307,21 @@ public class PortGateCapability extends CapabilitySupport<PortGateCapability.Cfg
             log.warn("Invalid scopedPort, using default {}", DEFAULT_PORT);
         }
         boolean audit = Boolean.parseBoolean(p.getOrDefault("auditMode", "false"));
+        boolean readOnly = Boolean.parseBoolean(p.getOrDefault("readOnly", "false"));
         List<String> prefixes = PortGateConfig.parseRepos(p.getOrDefault("enabledRepos", ""));
-        return new Cfg(port, prefixes, audit);
+        return new Cfg(port, prefixes, audit, readOnly);
     }
 
     @Override
     protected void onUpdate(Cfg c) throws Exception {
-        portGateConfig.update(c.scopedPort, c.allowedPrefixes, c.auditMode);
-        log.info("Port-gate updated: port={} | {} repos | audit={}", c.scopedPort, c.allowedPrefixes.size(), c.auditMode);
+        portGateConfig.update(c.scopedPort, c.allowedPrefixes, c.auditMode, c.readOnly);
+        log.info("Port-gate updated: port={} | {} repos | audit={} | readOnly={}", c.scopedPort, c.allowedPrefixes.size(), c.auditMode, c.readOnly);
     }
 
     @Override
     protected void onActivate(Cfg c) throws Exception {
-        portGateConfig.update(c.scopedPort, c.allowedPrefixes, c.auditMode);
-        log.info("Port-gate activated: port={} | {} repos | audit={}", c.scopedPort, c.allowedPrefixes.size(), c.auditMode);
+        portGateConfig.update(c.scopedPort, c.allowedPrefixes, c.auditMode, c.readOnly);
+        log.info("Port-gate activated: port={} | {} repos | audit={} | readOnly={}", c.scopedPort, c.allowedPrefixes.size(), c.auditMode, c.readOnly);
         log.info("Port-gate: ensure Nexus is listening on port {} (Jetty config or reverse proxy)", c.scopedPort);
     }
 
@@ -309,17 +342,19 @@ public class PortGateCapability extends CapabilitySupport<PortGateCapability.Cfg
         Cfg c = getConfig();
         if (c == null) return "Not configured";
         return "Port " + c.scopedPort + " | " + c.allowedPrefixes.size() + " repo(s)"
-            + (c.auditMode ? " | AUDIT MODE" : "");
+            + (c.auditMode ? " | AUDIT" : "") + (c.readOnly ? " | READ-ONLY" : "");
     }
 
     static final class Cfg {
         final int scopedPort;
         final List<String> allowedPrefixes;
         final boolean auditMode;
-        Cfg(int port, List<String> prefixes, boolean audit) {
+        final boolean readOnly;
+        Cfg(int port, List<String> prefixes, boolean audit, boolean readOnly) {
             this.scopedPort = port;
             this.allowedPrefixes = prefixes;
             this.auditMode = audit;
+            this.readOnly = readOnly;
         }
     }
 }
@@ -355,6 +390,7 @@ public class PortGateCapabilityDescriptor extends CapabilityDescriptorSupport {
     private final NumberTextFormField portField;
     private final ItemselectFormField reposField;
     private final CheckboxFormField auditField;
+    private final CheckboxFormField readOnlyField;
 
     public PortGateCapabilityDescriptor() {
         portField = new NumberTextFormField(
@@ -384,20 +420,26 @@ public class PortGateCapabilityDescriptor extends CapabilityDescriptorSupport {
             + "Use this to test your allowlist before switching to enforcement. "
             + "Monitor logs with: grep AUDIT-DENY nexus.log",
             FormField.OPTIONAL);
+
+        readOnlyField = new CheckboxFormField(
+            "readOnly", "Read-only mode (block writes)",
+            "When checked, agents can download from enabled repositories but cannot upload, "
+            + "publish, or delete artifacts. POST, PUT, DELETE, and PATCH methods are blocked "
+            + "with HTTP 403. GET and HEAD are unaffected.",
+            FormField.OPTIONAL);
     }
 
     @Override public CapabilityType type() { return new CapabilityType(PortGateCapability.TYPE_ID); }
     @Override public String name() { return "Agent Trust: Port Gate"; }
-    @Override public int version() { return 3; }
+    @Override public int version() { return 4; }
     @Override public String about() {
         return "Controls which repositories AI agents can access on a scoped port. "
-            + "Audit mode logs what would be denied without blocking. "
-            + "Enforce mode blocks with HTTP 403. "
+            + "Audit mode logs without blocking. Read-only mode blocks uploads and deletes. "
             + "Create multiple instances for different agent contexts. "
             + "Changes apply instantly without restart.";
     }
     @Override public List<FormField> formFields() {
-        return List.of(portField, reposField, auditField);
+        return List.of(portField, reposField, auditField, readOnlyField);
     }
     @Override @SuppressWarnings("rawtypes") protected Object createConfig(Map p) { return p; }
 }
